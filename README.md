@@ -188,7 +188,7 @@ We decouple health into two interacting variables:
 * **`Score` $[0.0, 10.0]$:** Earned incrementally on successful checks.
 * **`Penalty` $[0.0, \infty)$:** Incremented on failures.
 
-$$\text{base\_minutes} = \max\left(1.0, \; \min\left(2880.0, \; 15.0 \cdot \frac{2^{\text{Penalty}}}{2.5^{\text{Score}}}\right)\right)$$
+$$\text{baseMinutes} = \max\left(1.0, \; \min\left(2880.0, \; 15.0 \cdot \frac{2^{\text{Penalty}}}{2.5^{\text{Score}}}\right)\right)$$
 
 Because **$2.5 > 2.0$**, score is weighted more heavily than penalty:
 * **The Veteran Shield:** A proxy with `Score = 10.0` that fails will evaluate to a **1-minute ban** ($\text{base} \approx 0.007\text{m}$, clamped to $1.0\text{m}$). It stays in the active retry loop to catch quick recoveries. If the outage continues, its score gradually depletes until the exponential penalty takes over.
@@ -204,7 +204,7 @@ The engine applies a continuous $\pm 15\%$ uniform random jitter to all bans ove
 
 $$\text{jitter} = 0.85 + (0.30 \times \text{rand}())$$
 
-$$\text{ban\_minutes} = \max(1.0, \; \text{base\_minutes} \times \text{jitter})$$
+$$\text{banMinutes} = \max(1.0, \; \text{baseMinutes} \times \text{jitter})$$
 
 This smooths out periodic surges into a continuous, low-overhead background stream.
 
@@ -222,7 +222,7 @@ go run .\cmd\proxy_lab\main.go -interval 5m -samples 100 -table table.csv
 
 You can inspect the generated telemetry using the standalone web dashboard:
 
-👉 **Interactive Dashboard Visualizer:** [theslopmachine.github.io/proxypool](https://theslopmachine.github.io/proxypool)
+👉 **Interactive Dashboard Visualizer:** [theslopmachine.github.io/proxypool/web/proxy_viewer.html](https://theslopmachine.github.io/proxypool/web/proxy_viewer.html)
 
 *(The visualizer runs client-side in your browser; drop your generated CSV into the page to plot latency distributions, pool churn, and stability curves).*
 
