@@ -11,16 +11,17 @@ import (
 // ProxyState holds internal lifecycle, scoring, and operational metadata.
 // Stored inside CacheSource and managed solely by ProxyPool.
 type ProxyState struct {
-	URL           string        // Canonical proxy URL (e.g., "http://1.2.3.4:8080")
-	IP            string        // Target IP or hostname
-	Port          int           // Target port
-	Location      string        // 2-letter ISO country code discovered via Cloudflare trace (e.g., "DE")
-	IsDead        bool          // Operational status
-	Penalty       float64       // Accumulated backoff penalty weight
-	Score         float64       // Reputation credit [0.0 - 10.0]
-	ReviveAt      time.Time     // Timestamp when dead proxy can be re-tested
-	LastCheckedAt time.Time     // Timestamp of last probe (used for delta normalization)
-	Latency       time.Duration // Last measured round-trip time
+	URL           string            // Canonical proxy URL (e.g., "http://1.2.3.4:8080")
+	IP            string            // Target IP or hostname
+	Port          int               // Target port
+	Location      string            // 2-letter ISO country code discovered via Cloudflare trace (e.g., "DE")
+	IsDead        bool              // Operational status
+	Penalty       float64           // Accumulated backoff penalty weight
+	Score         float64           // Reputation credit [0.0 - 10.0]
+	ReviveAt      time.Time         // Timestamp when dead proxy can be re-tested
+	LastCheckedAt time.Time         // Timestamp of last probe (used for delta normalization)
+	Latency       time.Duration     // Last measured round-trip time
+	Metadata      map[string]string // Optional user-attached custom metadata (nil = none)
 }
 
 // ProxyInfo represents a validated, consumer-ready proxy returned by ListProxies.
@@ -119,4 +120,4 @@ type RefreshReporter interface {
 type noopReporter struct{}
 
 func (n *noopReporter) ReportProxy(_ ProxyReport) {}
-func (n *noopReporter) Report(_ RefreshReport)      {}
+func (n *noopReporter) Report(_ RefreshReport)    {}

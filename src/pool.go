@@ -3,7 +3,7 @@ package proxypool
 import (
 	"math"
 	"sort"
-    "strings"
+	"strings"
 	"sync"
 	"time"
 )
@@ -285,4 +285,44 @@ func (p *ProxyPool) ListProxies(filter ProxyFilter) []ProxyInfo {
 	}
 
 	return matches
+}
+
+// UpdateMetadata runs update against the custom metadata map for the given
+// proxy URL (exact match, no normalization). Initializes the map if nil.
+// No-op if the proxy is unknown or update is nil.
+func (p *ProxyPool) UpdateMetadata(url string, update func(map[string]string)) {
+	if update == nil {
+		return
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	state, ok := p.cache.Get(url)
+	if !ok {
+		return
+	}
+	if state.Metadata == nil {
+		state.Metadata = make(map[string]string)
+	}
+	update(state.Metadata)
+	p.cache.Set(state)
+}
+
+// GetMetadata returns a copy of the custom metadata for the given proxy URL
+// (exact match, no normalization). Returns a new empty map if the proxy is
+// unknown or has no metadata. The returned map is detached from the pool.
+func (p *ProxyPool) GetMetadata(url string) map[string]string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	state, ok := p.cache.Get(url)
+	if !ok || state.Metadata == nil {
+		return make(map[string]string)
+	}
+	out := make(map[string]string, len(state.Metadata))
+	for k, v := range state.Metadata {
+		out[k] = v
+	}
+	return out
 }
