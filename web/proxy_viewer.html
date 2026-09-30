@@ -75,26 +75,11 @@
     <div id="dashboard" class="hidden space-y-6">
       
       <!-- KPI Stats Grid -->
-      <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4">
+      <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-4">
         <div class="bg-slate-900/70 border border-slate-800/80 p-4 rounded-xl">
           <span class="text-xs font-medium text-slate-400">Total Samples</span>
           <div id="kpiSamples" class="text-2xl font-bold text-white mt-1">0</div>
           <span id="kpiDuration" class="text-[11px] text-slate-500">Span: 0h</span>
-        </div>
-        <div class="bg-slate-900/70 border border-slate-800/80 p-4 rounded-xl">
-          <span class="text-xs font-medium text-slate-400">Active Pool (Alive)</span>
-          <div id="kpiAlive" class="text-2xl font-bold text-emerald-400 mt-1">0</div>
-          <span id="kpiAliveRange" class="text-[11px] text-slate-500">Min: 0 | Max: 0</span>
-        </div>
-        <div class="bg-slate-900/70 border border-slate-800/80 p-4 rounded-xl">
-          <span class="text-xs font-medium text-slate-400">Latency Range</span>
-          <div id="kpiLowestLat" class="text-2xl font-bold text-cyan-400 mt-1">0ms</div>
-          <span id="kpiMedLatAvg" class="text-[11px] text-slate-500">Avg Median: 0ms</span>
-        </div>
-        <div class="bg-slate-900/70 border border-slate-800/80 p-4 rounded-xl">
-          <span class="text-xs font-medium text-slate-400">Average Score</span>
-          <div id="kpiScoreAvg" class="text-2xl font-bold text-blue-400 mt-1">0.0</div>
-          <span class="text-[11px] text-slate-500">Max Score: 10.0</span>
         </div>
         <div class="bg-slate-900/70 border border-slate-800/80 p-4 rounded-xl">
           <span class="text-xs font-medium text-slate-400">Total Upstream 200s</span>
@@ -102,9 +87,19 @@
           <span id="kpiUpstream304" class="text-[11px] text-slate-500">304s: 0</span>
         </div>
         <div class="bg-slate-900/70 border border-slate-800/80 p-4 rounded-xl">
-          <span class="text-xs font-medium text-slate-400">Top Volatile Node</span>
-          <div id="kpiTopFlapper" class="text-2xl font-bold text-amber-400 mt-1">-</div>
-          <span id="kpiTopFlapperCount" class="text-[11px] text-slate-500">0 events</span>
+          <span class="text-xs font-medium text-slate-400">Active Pool (Average)</span>
+          <div id="kpiAlive" class="text-2xl font-bold text-emerald-400 mt-1">0</div>
+          <span id="kpiAliveRange" class="text-[11px] text-slate-500">Min: 0 | Max: 0</span>
+        </div>
+        <div class="bg-slate-900/70 border border-slate-800/80 p-4 rounded-xl">
+          <span class="text-xs font-medium text-slate-400">Average Best Latency</span>
+          <div id="kpiLowestLat" class="text-2xl font-bold text-cyan-400 mt-1">0ms</div>
+          <span id="kpiMedLatAvg" class="text-[11px] text-slate-500">Avg Median: 0ms</span>
+        </div>
+        <div class="bg-slate-900/70 border border-slate-800/80 p-4 rounded-xl">
+          <span class="text-xs font-medium text-slate-400">Average Score</span>
+          <div id="kpiScoreAvg" class="text-2xl font-bold text-blue-400 mt-1">0.0</div>
+          <span id="kpiScoreMax" class="text-[11px] text-slate-500">Max Avg: 0.0</span>
         </div>
       </div>
 
@@ -115,7 +110,7 @@
         <div class="bg-slate-900/70 border border-slate-800/80 rounded-xl p-5 space-y-3">
           <div class="flex items-center justify-between">
             <h3 class="text-sm font-semibold text-white">Proxy Pool Dynamics</h3>
-            <span class="text-[11px] text-slate-400">Alive vs Probed vs Tidal Waves</span>
+            <span class="text-[11px] text-slate-400">Alive vs Probed vs 200 Influx</span>
           </div>
           <div class="h-64">
             <canvas id="chartPool"></canvas>
@@ -319,48 +314,32 @@
         document.getElementById('kpiDuration').textContent = `Span: ~${diffHrs}h`;
       }
 
-      // Alive metrics
+      // Alive metrics (mean across all samples)
       const aliveValues = parsedRows.map(r => r.alive);
       const minAlive = Math.min(...aliveValues);
       const maxAlive = Math.max(...aliveValues);
-      const latestAlive = parsedRows[parsedRows.length - 1].alive;
-      document.getElementById('kpiAlive').textContent = latestAlive;
+      const meanAlive = Math.round(aliveValues.reduce((acc, v) => acc + v, 0) / totalSamples);
+      document.getElementById('kpiAlive').textContent = meanAlive;
       document.getElementById('kpiAliveRange').textContent = `Min: ${minAlive} | Max: ${maxAlive}`;
 
-      // Latency metrics
+      // Latency metrics (means across all samples)
       const minLats = parsedRows.map(r => r.minLat).filter(n => n > 0);
-      const lowestOverall = minLats.length ? Math.min(...minLats) : 0;
-      const avgMedLat = (parsedRows.reduce((acc, r) => acc + r.medLat, 0) / totalSamples).toFixed(0);
-      document.getElementById('kpiLowestLat').textContent = `${lowestOverall}ms`;
-      document.getElementById('kpiMedLatAvg').textContent = `Avg Median: ${avgMedLat}ms`;
+      const meanMinLat = minLats.length ? Math.round(minLats.reduce((acc, v) => acc + v, 0) / minLats.length) : 0;
+      const meanMedLat = Math.round(parsedRows.reduce((acc, r) => acc + r.medLat, 0) / totalSamples);
+      document.getElementById('kpiLowestLat').textContent = `${meanMinLat}ms`;
+      document.getElementById('kpiMedLatAvg').textContent = `Avg Median: ${meanMedLat}ms`;
 
-      // Score
-      const latestAvgScore = parsedRows[parsedRows.length - 1].avgScore.toFixed(2);
-      document.getElementById('kpiScoreAvg').textContent = latestAvgScore;
+      // Score (mean across all samples)
+      const meanAvgScore = (parsedRows.reduce((acc, r) => acc + r.avgScore, 0) / totalSamples).toFixed(2);
+      const maxAvgScore = Math.max(...parsedRows.map(r => r.avgScore)).toFixed(2);
+      document.getElementById('kpiScoreAvg').textContent = meanAvgScore;
+      document.getElementById('kpiScoreMax').textContent = `Max Avg: ${maxAvgScore}`;
 
       // Upstream HTTP counts
       const count200 = parsedRows.filter(r => r.http === 200).length;
       const count304 = parsedRows.filter(r => r.http === 304).length;
       document.getElementById('kpiUpstream200').textContent = count200;
       document.getElementById('kpiUpstream304').textContent = `304s: ${count304}`;
-
-      // Flapper frequency calculation
-      const nameFreq = {};
-      parsedRows.forEach(r => {
-        r.diedNames.forEach(n => nameFreq[n] = (nameFreq[n] || 0) + 1);
-        r.revivedNames.forEach(n => nameFreq[n] = (nameFreq[n] || 0) + 1);
-      });
-
-      let topFlapper = '-';
-      let topCount = 0;
-      for (const [name, count] of Object.entries(nameFreq)) {
-        if (count > topCount) {
-          topCount = count;
-          topFlapper = name;
-        }
-      }
-      document.getElementById('kpiTopFlapper').textContent = topFlapper;
-      document.getElementById('kpiTopFlapperCount').textContent = `${topCount} churn events`;
     }
 
     function renderCharts() {
@@ -397,6 +376,19 @@
               backgroundColor: 'rgba(56, 189, 248, 0.4)',
               type: 'bar',
               yAxisID: 'y'
+            },
+            {
+              label: 'Upstream 200 (Influx)',
+              data: parsedRows.map(r => r.http === 200 ? r.probed - r.revive : null),
+              type: 'line',
+              showLine: false,
+              pointStyle: 'rectRot',
+              pointRadius: 6,
+              pointHoverRadius: 8,
+              pointBackgroundColor: '#818cf8',
+              pointBorderColor: '#ffffff',
+              pointBorderWidth: 1,
+              spanGaps: true
             }
           ]
         },
@@ -509,7 +501,26 @@
         plugins: {
           legend: {
             position: 'top',
-            labels: { boxWidth: 12, color: '#94a3b8', font: { size: 10 } }
+            labels: {
+              boxWidth: 12,
+              usePointStyle: true,
+              color: '#94a3b8',
+              font: { size: 10 },
+              generateLabels(chart) {
+                const items = Chart.defaults.plugins.legend.labels.generateLabels(chart);
+                items.forEach(item => {
+                  const ds = chart.data.datasets[item.datasetIndex] || {};
+                  if (ds.label === 'Upstream 200 (Influx)') {
+                    item.pointStyle = 'rectRot';
+                  } else if (ds.type === 'bar' || chart.config.type === 'bar') {
+                    item.pointStyle = 'rect';
+                  } else {
+                    item.pointStyle = 'line';
+                  }
+                });
+                return items;
+              }
+            }
           },
           tooltip: { padding: 10 }
         },
