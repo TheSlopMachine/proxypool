@@ -17,6 +17,9 @@ coverage.*
 *.coverprofile
 profile.cov
 
+# Generated research telemetry (proxy_lab -table output)
+*.csv
+
 # Dependency directories (remove the comment below to include it)
 # vendor/
 
