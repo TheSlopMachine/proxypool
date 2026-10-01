@@ -210,6 +210,12 @@ This smooths out periodic surges into a continuous, low-overhead background stre
 
 ---
 
+### 5. Manual Exclusion (`MarkDead`)
+
+Probes cannot observe every fault: a proxy passing TCP handshakes and liveness checks may still break a specific upstream (e.g., TLS interception that only fails certificate verification). `MarkDead` records such upstream-observed faults on a channel orthogonal to probe scoring: it flips `IsDead`, extends `ReviveAt` on an escalating schedule ($15\text{m} \to 4\text{h}$ cap), and tracks its own counter in metadata. It never touches `Score` or `Penalty`, so neither the Veteran Shield nor probe healing can undo a manual mark, and manual marks never corrupt earned reputation. Repeat marks escalate; a full idle day forgives. Refresh write-back merges newer manual marks over stale pipeline snapshots instead of overwriting them.
+
+---
+
 ## Research: Proxy Lab & Visualizer
 
 The repository includes a companion research tool in `cmd/proxy_lab/` used to run empirical benchmarks and tune scoring parameters.

@@ -3,6 +3,7 @@ package proxypool
 import (
 	"math"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -158,6 +159,11 @@ func (p *ProxyPool) Refresh() {
 	diedCount := 0
 
 	for i, st := range updatedStates {
+		// The pipeline ran on a snapshot; a manual mark landing
+		// mid-cycle must survive this write-back.
+		if current, ok := cache.Get(st.URL); ok {
+			st = mergeManualMark(current, st)
+		}
 		cache.Set(st)
 		reporter.ReportProxy(proxyReports[i])
 		if !st.IsDead {
@@ -287,12 +293,28 @@ func (p *ProxyPool) ListProxies(filter ProxyFilter) []ProxyInfo {
 	return matches
 }
 
-// PenalizeProxy forces a failure penalty on the proxy with the given
-// canonical URL, reusing the verification pipeline backoff in applyFailure.
-// Unknown or empty URLs return false. Repeated penalties extend ReviveAt
-// through the existing exponential schedule. Reason is recorded in metadata
-// when non-empty.
-func (p *ProxyPool) PenalizeProxy(url, reason string) bool {
+// Manual exclusion schedule for MarkDead. Bans escalate per repeat mark
+// and stay below the feed refresh cycle; forgiveness outlives the maximum
+// flap period so re-offending proxies never qualify.
+const (
+	markDeadBaseBan      = 15 * time.Minute
+	markDeadMaxBan       = 4 * time.Hour
+	markDeadForgiveAfter = 24 * time.Hour
+)
+
+// Metadata keys carrying manual exclusion memory. Score and Penalty stay
+// probe-only; these keys live on a separate channel the probe never heals.
+const (
+	markCountKey  = "manual_dead_count"
+	markLastAtKey = "manual_dead_last_at"
+	markReasonKey = "manual_dead_reason"
+)
+
+// MarkDead excludes the proxy with the given canonical URL until an
+// escalating ban expires. It records an upstream-observed fault the probe
+// cannot see, so it never touches Score or Penalty. Unknown or empty URLs
+// return false. Repeat marks extend the ban; a full idle day forgives.
+func (p *ProxyPool) MarkDead(url, reason string) bool {
 	if url == "" {
 		return false
 	}
@@ -308,13 +330,32 @@ func (p *ProxyPool) PenalizeProxy(url, reason string) bool {
 		return false
 	}
 	now := time.Now().UTC()
-	applyFailure(&state, now)
-	if reason != "" {
-		if state.Metadata == nil {
-			state.Metadata = make(map[string]string)
-		}
-		state.Metadata["last_penalty_reason"] = reason
+	count := markCount(state.Metadata)
+	if last := markLastAt(state.Metadata); !last.IsZero() && now.Sub(last) > markDeadForgiveAfter {
+		count = 0
 	}
+	count++
+	ban := markDeadBaseBan
+	for i := 1; i < count && ban < markDeadMaxBan; i++ {
+		ban *= 2
+		if ban > markDeadMaxBan || ban <= 0 {
+			ban = markDeadMaxBan
+			break
+		}
+	}
+	if state.Metadata == nil {
+		state.Metadata = make(map[string]string)
+	}
+	state.Metadata[markCountKey] = strconv.Itoa(count)
+	state.Metadata[markLastAtKey] = now.Format(time.RFC3339)
+	if reason != "" {
+		state.Metadata[markReasonKey] = reason
+	}
+	state.IsDead = true
+	if revive := now.Add(ban); revive.After(state.ReviveAt) {
+		state.ReviveAt = revive
+	}
+	state.LastCheckedAt = now
 	p.cache.Set(state)
 	if p.reporter != nil {
 		p.reporter.ReportProxy(ProxyReport{
@@ -329,6 +370,48 @@ func (p *ProxyPool) PenalizeProxy(url, reason string) bool {
 		})
 	}
 	return true
+}
+
+// mergeManualMark preserves a newer manual exclusion over pipeline output.
+// Refresh snapshots candidates before probing; a mark landing mid-cycle
+// must survive the stale write-back. Equal counts mean no intervening
+// mark, so the pipeline verdict stands.
+func mergeManualMark(current, updated ProxyState) ProxyState {
+	if markCount(current.Metadata) <= markCount(updated.Metadata) {
+		return updated
+	}
+	updated.IsDead = true
+	if current.ReviveAt.After(updated.ReviveAt) {
+		updated.ReviveAt = current.ReviveAt
+	}
+	if !current.LastCheckedAt.IsZero() && current.LastCheckedAt.After(updated.LastCheckedAt) {
+		updated.LastCheckedAt = current.LastCheckedAt
+	}
+	if updated.Metadata == nil {
+		updated.Metadata = make(map[string]string)
+	}
+	for _, k := range []string{markCountKey, markLastAtKey, markReasonKey} {
+		if v, ok := current.Metadata[k]; ok {
+			updated.Metadata[k] = v
+		}
+	}
+	return updated
+}
+
+func markCount(metadata map[string]string) int {
+	n, err := strconv.Atoi(metadata[markCountKey])
+	if err != nil || n < 0 {
+		return 0
+	}
+	return n
+}
+
+func markLastAt(metadata map[string]string) time.Time {
+	t, err := time.Parse(time.RFC3339, metadata[markLastAtKey])
+	if err != nil {
+		return time.Time{}
+	}
+	return t
 }
 
 // UpdateMetadata runs update against the custom metadata map for the given
