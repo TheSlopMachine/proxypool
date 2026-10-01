@@ -287,6 +287,50 @@ func (p *ProxyPool) ListProxies(filter ProxyFilter) []ProxyInfo {
 	return matches
 }
 
+// PenalizeProxy forces a failure penalty on the proxy with the given
+// canonical URL, reusing the verification pipeline backoff in applyFailure.
+// Unknown or empty URLs return false. Repeated penalties extend ReviveAt
+// through the existing exponential schedule. Reason is recorded in metadata
+// when non-empty.
+func (p *ProxyPool) PenalizeProxy(url, reason string) bool {
+	if url == "" {
+		return false
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.cache == nil {
+		return false
+	}
+	state, ok := p.cache.Get(url)
+	if !ok {
+		return false
+	}
+	now := time.Now().UTC()
+	applyFailure(&state, now)
+	if reason != "" {
+		if state.Metadata == nil {
+			state.Metadata = make(map[string]string)
+		}
+		state.Metadata["last_penalty_reason"] = reason
+	}
+	p.cache.Set(state)
+	if p.reporter != nil {
+		p.reporter.ReportProxy(ProxyReport{
+			Timestamp: now,
+			URL:       state.URL,
+			Location:  state.Location,
+			IsDead:    state.IsDead,
+			Score:     state.Score,
+			Penalty:   state.Penalty,
+			ReviveAt:  state.ReviveAt,
+			Latency:   state.Latency,
+		})
+	}
+	return true
+}
+
 // UpdateMetadata runs update against the custom metadata map for the given
 // proxy URL (exact match, no normalization). Initializes the map if nil.
 // No-op if the proxy is unknown or update is nil.
