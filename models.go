@@ -110,14 +110,25 @@ type ProxySource interface {
 	FetchList() []string // Returns raw proxy URLs; empty slice means no changes (e.g., 304)
 }
 
+// RefreshProgressReport carries raw in-cycle progress; the reporter derives
+// any display percent from Completed/Total.
+type RefreshProgressReport struct {
+	Timestamp time.Time     // UTC timestamp when the refresh cycle started
+	Completed int           // Results drained so far
+	Total     int           // Total candidates in this cycle
+	Elapsed   time.Duration // Since cycle start
+}
+
 // RefreshReporter receives structured metrics during and after a refresh cycle.
 type RefreshReporter interface {
 	ReportProxy(report ProxyReport)
 	Report(report RefreshReport)
+	ReportProgress(report RefreshProgressReport)
 }
 
 // noopReporter ensures safe execution when no custom reporter is registered.
 type noopReporter struct{}
 
-func (n *noopReporter) ReportProxy(_ ProxyReport) {}
-func (n *noopReporter) Report(_ RefreshReport)    {}
+func (n *noopReporter) ReportProxy(_ ProxyReport)    {}
+func (n *noopReporter) Report(_ RefreshReport)       {}
+func (n *noopReporter) ReportProgress(_ RefreshProgressReport) {}

@@ -352,6 +352,20 @@ func (r *LabReporter) ReportProxy(p proxypool.ProxyReport) {
 	}
 }
 
+// ReportProgress streams in-cycle probe progress to stderr. Percent is
+// derived here from the raw counts; the pool only sends Completed/Total.
+func (r *LabReporter) ReportProgress(p proxypool.RefreshProgressReport) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	pct := 0.0
+	if p.Total > 0 {
+		pct = 100 * float64(p.Completed) / float64(p.Total)
+	}
+	fmt.Fprintf(os.Stderr, "probe progress: %d/%d (%.0f%%) in %v\n",
+		p.Completed, p.Total, pct, p.Elapsed.Round(time.Second))
+}
+
 // formatNames sorts the per-cycle names and caps the cell at maxNamesPerCell
 // entries with a single +N-more overflow token.
 func formatNames(names []string) string {

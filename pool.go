@@ -197,7 +197,7 @@ func (p *ProxyPool) Refresh() {
 	}
 
 	// 3. Execution & Verification Pipeline
-	updatedStates, proxyReports := executePipeline(candidates, concurrency, handshakeTimeout, probeTimeout, now)
+	updatedStates, proxyReports := executePipeline(candidates, concurrency, handshakeTimeout, probeTimeout, now, reporter)
 
 	// 4. Persist Updates & Stream Proxy Reports
 	survivedCount := 0

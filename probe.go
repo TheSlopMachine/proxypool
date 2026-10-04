@@ -11,7 +11,6 @@ import (
 	"math/rand/v2"
 	"net"
 	"net/http"
-	"os"
 	"strings"
 	"sync"
 	"time"
@@ -228,12 +227,15 @@ func applyFailure(state *ProxyState, now time.Time) {
 // fast TCP/CONNECT/SOCKS greeting filter, probeTimeout bounds the full
 // HTTP/TLS exchange. Probe workers equal handshake workers (no /2 throttle)
 // so 1000-way concurrency sustains ~1000 dials without halving throughput
-// on stock Windows. Every wait is ctx/deadline-bounded; progress is
-// reported to stderr every 5000 completions so silence means idleness,
+// on stock Windows. Every wait is ctx/deadline-bounded; progress flows
+// through reporter every 5000 completions so silence means idleness,
 // not a parked pipeline.
-func executePipeline(candidates []ProxyState, concurrency int, handshakeTimeout, probeTimeout time.Duration, now time.Time) ([]ProxyState, []ProxyReport) {
+func executePipeline(candidates []ProxyState, concurrency int, handshakeTimeout, probeTimeout time.Duration, now time.Time, reporter RefreshReporter) ([]ProxyState, []ProxyReport) {
 	if len(candidates) == 0 {
 		return nil, nil
+	}
+	if reporter == nil {
+		reporter = &noopReporter{}
 	}
 
 	type probeResult struct {
@@ -380,10 +382,12 @@ func executePipeline(candidates []ProxyState, concurrency int, handshakeTimeout,
 
 		completed++
 		if completed%5000 == 0 || completed == len(candidates) {
-			fmt.Fprintf(os.Stderr, "probe progress: %d/%d (%.0f%%) in %v\n",
-				completed, len(candidates),
-				100*float64(completed)/float64(len(candidates)),
-				time.Since(progressTick).Round(time.Second))
+			reporter.ReportProgress(RefreshProgressReport{
+				Timestamp: now,
+				Completed: completed,
+				Total:     len(candidates),
+				Elapsed:   time.Since(progressTick).Round(time.Second),
+			})
 		}
 	}
 
