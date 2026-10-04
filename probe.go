@@ -11,6 +11,7 @@ import (
 	"math/rand/v2"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -25,23 +26,25 @@ const (
 // verifyHandshake confirms the proxy tunnels to the handshake target.
 // HTTP(S) proxies answer a raw CONNECT; SOCKS proxies open the same target
 // through their own handshake, with userinfo credentials when present.
-func verifyHandshake(proxyURL string, timeout time.Duration) error {
+// ctx carries the per-proxy deadline so tarpits fail fast instead of
+// parking a handshake worker indefinitely.
+func verifyHandshake(ctx context.Context, proxyURL string, timeout time.Duration) error {
 	p, err := parseProxyURL(proxyURL)
 	if err != nil {
 		return err
 	}
 	switch p.scheme {
 	case "http", "https":
-		return verifyHTTPHandshake(p.address(), timeout)
+		return verifyHTTPHandshake(ctx, p.address(), timeout)
 	case "socks4":
-		conn, err := dialSOCKS4(context.Background(), p.address(), handshakeTarget, p.username, timeout)
+		conn, err := dialSOCKS4(ctx, p.address(), handshakeTarget, p.username, timeout)
 		if err != nil {
 			return err
 		}
 		conn.Close()
 		return nil
 	case "socks5":
-		conn, err := p.dialSOCKS5(context.Background(), handshakeTarget, timeout)
+		conn, err := p.dialSOCKS5(ctx, handshakeTarget, timeout)
 		if err != nil {
 			return err
 		}
@@ -52,10 +55,14 @@ func verifyHandshake(proxyURL string, timeout time.Duration) error {
 	}
 }
 
-// verifyHTTPHandshake performs a raw TCP HTTP CONNECT tunnel verification.
-func verifyHTTPHandshake(proxyAddr string, timeout time.Duration) error {
+// verifyHTTPHandshake performs a raw TCP HTTP CONNECT tunnel verification
+// under ctx + an absolute conn deadline covering dial, write, and reply read.
+func verifyHTTPHandshake(ctx context.Context, proxyAddr string, timeout time.Duration) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	dialer := &net.Dialer{Timeout: timeout}
-	conn, err := dialer.Dial("tcp", proxyAddr)
+	conn, err := dialer.DialContext(ctx, "tcp", proxyAddr)
 	if err != nil {
 		return err
 	}
@@ -121,6 +128,7 @@ func probeEndpoint(ctx context.Context, proxyURI string, needLocation bool, time
 	if err != nil {
 		return 0, "", err
 	}
+	defer transport.CloseIdleConnections()
 
 	client := &http.Client{
 		Transport: transport,
@@ -216,7 +224,14 @@ func applyFailure(state *ProxyState, now time.Time) {
 }
 
 // executePipeline coordinates concurrent Phase 1 (Handshake) and Phase 2 (Probe) checks.
-func executePipeline(candidates []ProxyState, concurrency int, timeout time.Duration, now time.Time) ([]ProxyState, []ProxyReport) {
+// Handshake and probe budgets are independent: handshakeTimeout bounds the
+// fast TCP/CONNECT/SOCKS greeting filter, probeTimeout bounds the full
+// HTTP/TLS exchange. Probe workers equal handshake workers (no /2 throttle)
+// so 1000-way concurrency sustains ~1000 dials without halving throughput
+// on stock Windows. Every wait is ctx/deadline-bounded; progress is
+// reported to stderr every 5000 completions so silence means idleness,
+// not a parked pipeline.
+func executePipeline(candidates []ProxyState, concurrency int, handshakeTimeout, probeTimeout time.Duration, now time.Time) ([]ProxyState, []ProxyReport) {
 	if len(candidates) == 0 {
 		return nil, nil
 	}
@@ -252,7 +267,10 @@ func executePipeline(candidates []ProxyState, concurrency int, timeout time.Dura
 				wasDead := item.IsDead
 				wasRevived := item.IsDead && !item.ReviveAt.IsZero() && !now.Before(item.ReviveAt)
 
-				if err := verifyHandshake(item.URL, timeout); err == nil {
+				hctx, cancel := context.WithTimeout(context.Background(), handshakeTimeout)
+				err := verifyHandshake(hctx, item.URL, handshakeTimeout)
+				cancel()
+				if err == nil {
 					handshakePassChan <- item
 				} else {
 					resultsChan <- probeResult{
@@ -274,20 +292,25 @@ func executePipeline(candidates []ProxyState, concurrency int, timeout time.Dura
 	// ------------------------------------------------------------------------
 	// Phase 2: Dual-Endpoint Probe (/trace vs generate_204)
 	// ------------------------------------------------------------------------
-	probeWorkers := max(1, min(concurrency/2, len(candidates)))
+	// Full-width workers: halving here (concurrency/2) collapsed throughput
+	// once SOCKS tarpits parked Phase-2 goroutines. Stock Windows sustains
+	// 1000 concurrent dials; TIME_WAIT churn stays safe because only the
+	// ~2% that pass the handshake hold a connected socket.
+	probeWorkers := max(1, min(concurrency, len(candidates)))
 	var wgProbe sync.WaitGroup
 
 	for i := 0; i < probeWorkers; i++ {
 		wgProbe.Add(1)
 		go func() {
 			defer wgProbe.Done()
-			ctx := context.Background()
 			for item := range handshakePassChan {
 				wasDead := item.IsDead
 				wasRevived := item.IsDead && !item.ReviveAt.IsZero() && !now.Before(item.ReviveAt)
 				needLocation := item.Location == ""
 
-				lat, loc, err := probeEndpoint(ctx, item.URL, needLocation, timeout)
+				pctx, cancel := context.WithTimeout(context.Background(), probeTimeout)
+				lat, loc, err := probeEndpoint(pctx, item.URL, needLocation, probeTimeout)
+				cancel()
 				if err == nil {
 					resultsChan <- probeResult{
 						state:      item,
@@ -320,6 +343,8 @@ func executePipeline(candidates []ProxyState, concurrency int, timeout time.Dura
 	updatedStates := make([]ProxyState, 0, len(candidates))
 	reports := make([]ProxyReport, 0, len(candidates))
 
+	completed := 0
+	progressTick := time.Now()
 	for res := range resultsChan {
 		st := res.state
 		var died, revived bool
@@ -352,6 +377,14 @@ func executePipeline(candidates []ProxyState, concurrency int, timeout time.Dura
 			Died:      died,
 			Revived:   revived,
 		})
+
+		completed++
+		if completed%5000 == 0 || completed == len(candidates) {
+			fmt.Fprintf(os.Stderr, "probe progress: %d/%d (%.0f%%) in %v\n",
+				completed, len(candidates),
+				100*float64(completed)/float64(len(candidates)),
+				time.Since(progressTick).Round(time.Second))
+		}
 	}
 
 	return updatedStates, reports

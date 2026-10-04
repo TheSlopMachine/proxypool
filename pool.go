@@ -11,21 +11,28 @@ import (
 
 // ProxyPool coordinates proxy discovery, lifecycle health, and consumer queries.
 type ProxyPool struct {
-	mu           sync.RWMutex
-	cache        CacheSource
-	sources      []ProxySource
-	reporter     RefreshReporter
-	checkTimeout time.Duration
-	concurrency  int
+	mu               sync.RWMutex
+	cache            CacheSource
+	sources          []ProxySource
+	reporter         RefreshReporter
+	checkTimeout     time.Duration
+	handshakeTimeout time.Duration
+	probeTimeout     time.Duration
+	concurrency      int
 }
 
-// NewPool initializes a pool with default in-memory storage and no-op reporting.
+// Stock-Windows-safe defaults: 1000 workers sustain ~55k probes in <10min
+// (51515/1000*5s≈257s worst-case) without exhausting the default 16k
+// ephemeral ports. Handshake is a fast 3s filter; the full HTTP/TLS probe
+// gets 5s. See transport.go for why every phase must be deadline-bounded.
 func NewPool() *ProxyPool {
 	pool := &ProxyPool{
-		sources:      make([]ProxySource, 0),
-		checkTimeout: 4 * time.Second,
-		concurrency:  500,
-		reporter:     &noopReporter{},
+		sources:          make([]ProxySource, 0),
+		checkTimeout:     5 * time.Second,
+		handshakeTimeout: 3 * time.Second,
+		probeTimeout:     5 * time.Second,
+		concurrency:      1000,
+		reporter:         &noopReporter{},
 	}
 	pool.RegisterCacheSource(newMemoryCache())
 	return pool
@@ -82,11 +89,33 @@ func (p *ProxyPool) SetConcurrency(n int) {
 }
 
 // SetTimeout configures the network timeout for handshakes and latency probes.
+// Kept for backward compatibility: sets both phases to d.
+// Prefer SetHandshakeTimeout/SetProbeTimeout for independent budgets.
 func (p *ProxyPool) SetTimeout(d time.Duration) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if d > 0 {
 		p.checkTimeout = d
+		p.handshakeTimeout = d
+		p.probeTimeout = d
+	}
+}
+
+// SetHandshakeTimeout bounds only the Phase-1 TCP/CONNECT/SOCKS greeting filter.
+func (p *ProxyPool) SetHandshakeTimeout(d time.Duration) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if d > 0 {
+		p.handshakeTimeout = d
+	}
+}
+
+// SetProbeTimeout bounds only the Phase-2 HTTP/TLS exchange.
+func (p *ProxyPool) SetProbeTimeout(d time.Duration) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if d > 0 {
+		p.probeTimeout = d
 	}
 }
 
@@ -105,7 +134,23 @@ func (p *ProxyPool) Refresh() {
 	sources := append([]ProxySource(nil), p.sources...)
 	reporter := p.reporter
 	concurrency := p.concurrency
-	timeout := p.checkTimeout
+	handshakeTimeout := p.handshakeTimeout
+	probeTimeout := p.probeTimeout
+	if handshakeTimeout <= 0 {
+		handshakeTimeout = p.checkTimeout
+	}
+	if probeTimeout <= 0 {
+		probeTimeout = p.checkTimeout
+	}
+	if handshakeTimeout <= 0 {
+		handshakeTimeout = 3 * time.Second
+	}
+	if probeTimeout <= 0 {
+		probeTimeout = 5 * time.Second
+	}
+	if concurrency <= 0 {
+		concurrency = 1000
+	}
 	p.mu.RUnlock()
 
 	// 1. Ingestion: Fetch URLs from sources & normalize
@@ -152,7 +197,7 @@ func (p *ProxyPool) Refresh() {
 	}
 
 	// 3. Execution & Verification Pipeline
-	updatedStates, proxyReports := executePipeline(candidates, concurrency, timeout, now)
+	updatedStates, proxyReports := executePipeline(candidates, concurrency, handshakeTimeout, probeTimeout, now)
 
 	// 4. Persist Updates & Stream Proxy Reports
 	survivedCount := 0

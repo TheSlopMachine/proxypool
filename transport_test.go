@@ -1,6 +1,7 @@
 package proxypool
 
 import (
+	"context"
 	"net"
 	"strings"
 	"testing"
@@ -219,18 +220,18 @@ func checkSOCKS5Auth(c net.Conn, user, pass string) bool {
 
 func TestVerifyHandshakeHTTP(t *testing.T) {
 	addr := startHTTPConnectServer(t, true)
-	if err := verifyHandshake("http://"+addr, testTimeout); err != nil {
+	if err := verifyHandshake(context.Background(), "http://"+addr, testTimeout); err != nil {
 		t.Fatalf("granting HTTP proxy must pass: %v", err)
 	}
-	if err := verifyHandshake("https://"+addr, testTimeout); err != nil {
+	if err := verifyHandshake(context.Background(), "https://"+addr, testTimeout); err != nil {
 		t.Fatalf("granting HTTPS proxy must pass: %v", err)
 	}
 
 	addr = startHTTPConnectServer(t, false)
-	if err := verifyHandshake("http://"+addr, testTimeout); err == nil {
+	if err := verifyHandshake(context.Background(), "http://"+addr, testTimeout); err == nil {
 		t.Fatal("rejecting HTTP proxy must fail")
 	}
-	if err := verifyHandshake("http://"+closedLoopback(t), testTimeout); err == nil {
+	if err := verifyHandshake(context.Background(), "http://"+closedLoopback(t), testTimeout); err == nil {
 		t.Fatal("closed port must fail")
 	}
 }
@@ -238,36 +239,36 @@ func TestVerifyHandshakeHTTP(t *testing.T) {
 func TestVerifyHandshakeSOCKS4(t *testing.T) {
 	var seen []string
 	addr := startSOCKS4Server(t, true, &seen)
-	if err := verifyHandshake("socks4://tester@"+addr, testTimeout); err != nil {
+	if err := verifyHandshake(context.Background(), "socks4://tester@"+addr, testTimeout); err != nil {
 		t.Fatalf("granting SOCKS4 proxy must pass: %v", err)
 	}
 	if len(seen) != 1 || seen[0] != "tester" {
 		t.Fatalf("userid must reach the server, got %q", seen)
 	}
-	if err := verifyHandshake("socks4a://"+addr, testTimeout); err != nil {
+	if err := verifyHandshake(context.Background(), "socks4a://"+addr, testTimeout); err != nil {
 		t.Fatalf("socks4a alias must pass: %v", err)
 	}
 
 	addr = startSOCKS4Server(t, false, nil)
-	if err := verifyHandshake("socks4://"+addr, testTimeout); err == nil {
+	if err := verifyHandshake(context.Background(), "socks4://"+addr, testTimeout); err == nil {
 		t.Fatal("rejecting SOCKS4 proxy must fail")
 	}
 }
 
 func TestVerifyHandshakeSOCKS5(t *testing.T) {
 	addr := startSOCKS5Server(t, false, "", "")
-	if err := verifyHandshake("socks5://"+addr, testTimeout); err != nil {
+	if err := verifyHandshake(context.Background(), "socks5://"+addr, testTimeout); err != nil {
 		t.Fatalf("granting SOCKS5 proxy must pass: %v", err)
 	}
 
 	addr = startSOCKS5Server(t, true, "alice", "s3cret")
-	if err := verifyHandshake("socks5://alice:s3cret@"+addr, testTimeout); err != nil {
+	if err := verifyHandshake(context.Background(), "socks5://alice:s3cret@"+addr, testTimeout); err != nil {
 		t.Fatalf("SOCKS5 with valid credentials must pass: %v", err)
 	}
-	if err := verifyHandshake("socks5://alice:wrong@"+addr, testTimeout); err == nil {
+	if err := verifyHandshake(context.Background(), "socks5://alice:wrong@"+addr, testTimeout); err == nil {
 		t.Fatal("SOCKS5 with wrong password must fail")
 	}
-	if err := verifyHandshake("socks5://"+addr, testTimeout); err == nil {
+	if err := verifyHandshake(context.Background(), "socks5://"+addr, testTimeout); err == nil {
 		t.Fatal("SOCKS5 without credentials against auth server must fail")
 	}
 }

@@ -215,28 +215,47 @@ func (s *SpeedXSource) LastStatus() int {
 }
 
 func (s *SpeedXSource) FetchList() []string {
+	// Fetch the 3 text feeds concurrently: sequential 3x30s worst-case
+	// becomes ~30s, well inside the 10min cycle budget.
+	type feedResult struct {
+		idx  int
+		urls []string
+	}
+	results := make([][]string, len(s.feeds))
+	var wg sync.WaitGroup
+	for i := range s.feeds {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			f := &s.feeds[idx]
+			body, status := f.fetch.Get(f.url)
+			if status != http.StatusOK {
+				return
+			}
+			var urls []string
+			for _, line := range strings.Split(string(body), "\n") {
+				line = strings.TrimSpace(strings.ReplaceAll(line, "\r", ""))
+				if line == "" {
+					continue
+				}
+				sep := strings.LastIndex(line, ":")
+				if sep <= 0 {
+					continue
+				}
+				host, portStr := line[:sep], line[sep+1:]
+				port, err := strconv.Atoi(portStr)
+				if strings.TrimSpace(host) == "" || err != nil || port < 1 || port > 65535 {
+					continue
+				}
+				urls = append(urls, f.scheme+"://"+line)
+			}
+			results[idx] = urls
+		}(i)
+	}
+	wg.Wait()
 	var urls []string
-	for _, f := range s.feeds {
-		body, status := f.fetch.Get(f.url)
-		if status != http.StatusOK {
-			continue
-		}
-		for _, line := range strings.Split(string(body), "\n") {
-			line = strings.TrimSpace(strings.ReplaceAll(line, "\r", ""))
-			if line == "" {
-				continue
-			}
-			idx := strings.LastIndex(line, ":")
-			if idx <= 0 {
-				continue
-			}
-			host, portStr := line[:idx], line[idx+1:]
-			port, err := strconv.Atoi(portStr)
-			if strings.TrimSpace(host) == "" || err != nil || port < 1 || port > 65535 {
-				continue
-			}
-			urls = append(urls, f.scheme+"://"+line)
-		}
+	for _, part := range results {
+		urls = append(urls, part...)
 	}
 	if len(urls) == 0 {
 		return nil
@@ -430,6 +449,9 @@ func main() {
 	intervalFlag := flag.Duration("interval", 15*time.Second, "Interval between refresh checks (e.g. 15s, 1m, 5m)")
 	samplesFlag := flag.Int("samples", 100, "How many samples to collect before exiting (0 for infinite)")
 	tableFlag := flag.String("table", "table.csv", "Path where to output pipe-separated CSV logs")
+	concurrencyFlag := flag.Int("concurrency", 1000, "Max concurrent probe workers (stock-Windows-safe default; 2000+ needs ephemeral-port tuning)")
+	timeoutFlag := flag.Duration("timeout", 5*time.Second, "Per-probe HTTP/TLS budget (also sets handshake when -handshake-timeout unset)")
+	handshakeFlag := flag.Duration("handshake-timeout", 3*time.Second, "Phase-1 TCP/CONNECT/SOCKS greeting budget")
 	flag.Parse()
 
 	// 1. Open destination table file
@@ -450,7 +472,17 @@ func main() {
 
 	// 3. Setup proxy pool, embedded upstream sources, and reporter
 	pool := proxypool.NewPool()
-	client := &http.Client{Timeout: 30 * time.Second}
+	pool.SetConcurrency(*concurrencyFlag)
+	pool.SetProbeTimeout(*timeoutFlag)
+	pool.SetHandshakeTimeout(*handshakeFlag)
+	// Feed client: whole-request 30s cap plus 10s TLS/header caps so a
+	// stalled CDN edge fails fast instead of blocking ingestion.
+	feedTransport := &http.Transport{
+		ResponseHeaderTimeout: 10 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
+	client := &http.Client{Timeout: 30 * time.Second, Transport: feedTransport}
 	proxifly := NewProxiflySource(client)
 	speedx := NewSpeedXSource(client)
 	monosans := NewMonosansSource(client)
@@ -461,7 +493,7 @@ func main() {
 	reporter := NewLabReporter(tableFile, proxifly, speedx, monosans)
 	pool.RegisterReporter(reporter)
 
-	fmt.Fprintf(os.Stderr, "Proxy Lab started.\n -> Interval: %v\n -> Samples:  %d\n -> Table:    %s\n\n", *intervalFlag, *samplesFlag, *tableFlag)
+	fmt.Fprintf(os.Stderr, "Proxy Lab started.\n -> Interval: %v\n -> Samples:  %d\n -> Table:    %s\n -> Concurrency: %d\n -> Probe timeout: %v\n -> Handshake timeout: %v\n\n", *intervalFlag, *samplesFlag, *tableFlag, *concurrencyFlag, *timeoutFlag, *handshakeFlag)
 
 	// Graceful shutdown on Ctrl+C
 	sigChan := make(chan os.Signal, 1)
