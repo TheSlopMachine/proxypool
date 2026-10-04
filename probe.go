@@ -230,12 +230,26 @@ func applyFailure(state *ProxyState, now time.Time) {
 // on stock Windows. Every wait is ctx/deadline-bounded; progress flows
 // through reporter every 5000 completions so silence means idleness,
 // not a parked pipeline.
-func executePipeline(candidates []ProxyState, concurrency int, handshakeTimeout, probeTimeout time.Duration, now time.Time, reporter RefreshReporter) ([]ProxyState, []ProxyReport) {
+// cycleStart is the raw time.Now() from Refresh (monotonic-bearing) used
+// only for Elapsed; now is the UTC record timestamp for report fields.
+func executePipeline(candidates []ProxyState, concurrency int, handshakeTimeout, probeTimeout time.Duration, now time.Time, reporter RefreshReporter, cycleStart time.Time) ([]ProxyState, []ProxyReport) {
 	if len(candidates) == 0 {
 		return nil, nil
 	}
 	if reporter == nil {
 		reporter = &noopReporter{}
+	}
+	if concurrency <= 0 {
+		concurrency = 1000
+	}
+	if handshakeTimeout <= 0 {
+		handshakeTimeout = 3 * time.Second
+	}
+	if probeTimeout <= 0 {
+		probeTimeout = 5 * time.Second
+	}
+	if cycleStart.IsZero() {
+		cycleStart = time.Now()
 	}
 
 	type probeResult struct {
@@ -346,7 +360,6 @@ func executePipeline(candidates []ProxyState, concurrency int, handshakeTimeout,
 	reports := make([]ProxyReport, 0, len(candidates))
 
 	completed := 0
-	progressTick := time.Now()
 	for res := range resultsChan {
 		st := res.state
 		var died, revived bool
@@ -386,7 +399,7 @@ func executePipeline(candidates []ProxyState, concurrency int, handshakeTimeout,
 				Timestamp: now,
 				Completed: completed,
 				Total:     len(candidates),
-				Elapsed:   time.Since(progressTick).Round(time.Second),
+				Elapsed:   time.Since(cycleStart).Round(time.Second),
 			})
 		}
 	}
