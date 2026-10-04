@@ -11,7 +11,18 @@ import (
 	"time"
 )
 
+// defaultPortByScheme supplies the implicit port when a proxy URL omits one.
+var defaultPortByScheme = map[string]int{
+	"http":   80,
+	"https":  443,
+	"socks4": 1080,
+	"socks5": 1080,
+}
+
 // normalizeProxyURL parses, normalizes, and extracts connection details.
+// Accepted schemes: http, https, socks4(+socks4a alias), socks5. Embedded
+// userinfo (user[:pass]@) is preserved in the canonical URL; socks4a
+// canonicalizes to socks4.
 func normalizeProxyURL(raw string) (canonicalURL string, host string, port int, err error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
@@ -28,27 +39,30 @@ func normalizeProxyURL(raw string) (canonicalURL string, host string, port int, 
 	}
 
 	scheme := strings.ToLower(u.Scheme)
-	if scheme != "http" && scheme != "https" {
+	if scheme == "socks4a" {
+		scheme = "socks4"
+	}
+	defaultPort, ok := defaultPortByScheme[scheme]
+	if !ok {
 		return "", "", 0, fmt.Errorf("unsupported protocol: %s", scheme)
 	}
 
-	h, pStr, err := net.SplitHostPort(u.Host)
-	if err != nil {
-		h = u.Host
-		if scheme == "https" {
-			port = 443
-		} else {
-			port = 80
-		}
-	} else {
-		port, err = strconv.Atoi(pStr)
-		if err != nil || port <= 0 || port > 65535 {
-			return "", "", 0, fmt.Errorf("invalid port: %s", pStr)
-		}
+	host = u.Hostname()
+	if host == "" {
+		return "", "", 0, fmt.Errorf("missing host: %s", raw)
+	}
+	if portStr := u.Port(); portStr == "" {
+		port = defaultPort
+	} else if port, err = strconv.Atoi(portStr); err != nil || port <= 0 || port > 65535 {
+		return "", "", 0, fmt.Errorf("invalid port: %s", portStr)
 	}
 
-	canonicalURL = fmt.Sprintf("%s://%s", scheme, net.JoinHostPort(h, strconv.Itoa(port)))
-	return canonicalURL, h, port, nil
+	authority := net.JoinHostPort(host, strconv.Itoa(port))
+	if u.User != nil {
+		authority = u.User.String() + "@" + authority
+	}
+	canonicalURL = fmt.Sprintf("%s://%s", scheme, authority)
+	return canonicalURL, host, port, nil
 }
 
 // medianDuration returns the 50th percentile duration from a slice.

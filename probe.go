@@ -11,8 +11,6 @@ import (
 	"math/rand/v2"
 	"net"
 	"net/http"
-	"net/url"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -24,8 +22,38 @@ const (
 	generate204URL  = "http://cp.cloudflare.com/generate_204"
 )
 
-// verifyHandshake performs a raw TCP HTTP CONNECT tunnel verification.
-func verifyHandshake(proxyAddr string, timeout time.Duration) error {
+// verifyHandshake confirms the proxy tunnels to the handshake target.
+// HTTP(S) proxies answer a raw CONNECT; SOCKS proxies open the same target
+// through their own handshake, with userinfo credentials when present.
+func verifyHandshake(proxyURL string, timeout time.Duration) error {
+	p, err := parseProxyURL(proxyURL)
+	if err != nil {
+		return err
+	}
+	switch p.scheme {
+	case "http", "https":
+		return verifyHTTPHandshake(p.address(), timeout)
+	case "socks4":
+		conn, err := dialSOCKS4(context.Background(), p.address(), handshakeTarget, p.username, timeout)
+		if err != nil {
+			return err
+		}
+		conn.Close()
+		return nil
+	case "socks5":
+		conn, err := p.dialSOCKS5(context.Background(), handshakeTarget, timeout)
+		if err != nil {
+			return err
+		}
+		conn.Close()
+		return nil
+	default:
+		return fmt.Errorf("unsupported protocol: %s", p.scheme)
+	}
+}
+
+// verifyHTTPHandshake performs a raw TCP HTTP CONNECT tunnel verification.
+func verifyHTTPHandshake(proxyAddr string, timeout time.Duration) error {
 	dialer := &net.Dialer{Timeout: timeout}
 	conn, err := dialer.Dial("tcp", proxyAddr)
 	if err != nil {
@@ -86,20 +114,12 @@ func is2xxResponse(b []byte) bool {
 	return code >= 200 && code < 300
 }
 
-// probeEndpoint conducts the dual-endpoint HTTP latency and location test.
+// probeEndpoint conducts the dual-endpoint latency and location test
+// through the proxy's own transport (HTTP CONNECT or SOCKS tunnel).
 func probeEndpoint(ctx context.Context, proxyURI string, needLocation bool, timeout time.Duration) (time.Duration, string, error) {
-	parsedProxy, err := url.Parse(proxyURI)
+	transport, err := TransportFor(proxyURI, timeout)
 	if err != nil {
 		return 0, "", err
-	}
-
-	transport := &http.Transport{
-		Proxy:             http.ProxyURL(parsedProxy),
-		DisableKeepAlives: true,
-		DialContext: (&net.Dialer{
-			Timeout: timeout,
-		}).DialContext,
-		ResponseHeaderTimeout: timeout,
 	}
 
 	client := &http.Client{
@@ -229,11 +249,10 @@ func executePipeline(candidates []ProxyState, concurrency int, timeout time.Dura
 		go func() {
 			defer wgHandshake.Done()
 			for item := range jobs {
-				proxyAddr := net.JoinHostPort(item.IP, strconv.Itoa(item.Port))
 				wasDead := item.IsDead
 				wasRevived := item.IsDead && !item.ReviveAt.IsZero() && !now.Before(item.ReviveAt)
 
-				if err := verifyHandshake(proxyAddr, timeout); err == nil {
+				if err := verifyHandshake(item.URL, timeout); err == nil {
 					handshakePassChan <- item
 				} else {
 					resultsChan <- probeResult{

@@ -11,7 +11,7 @@ import (
 // ProxyState holds internal lifecycle, scoring, and operational metadata.
 // Stored inside CacheSource and managed solely by ProxyPool.
 type ProxyState struct {
-	URL           string            // Canonical proxy URL (e.g., "http://1.2.3.4:8080")
+	URL           string            // Canonical proxy URL (e.g., "http://1.2.3.4:8080", "socks5://user:pass@1.2.3.4:1080")
 	IP            string            // Target IP or hostname
 	Port          int               // Target port
 	Location      string            // 2-letter ISO country code discovered via Cloudflare trace (e.g., "DE")

@@ -6,7 +6,7 @@ A high-performance, modular Go proxy pool library designed for public and privat
 
 ## Features
 
-* **Two-Phase Fast Verification:** Fast TCP `CONNECT` tunnel handshakes to weed out dead nodes with zero heap allocations, followed by dual-endpoint HTTP probing.
+* **Two-Phase Fast Verification:** Per-protocol tunnel handshakes (raw `CONNECT` for HTTP/S, in-house SOCKS4/4a, SOCKS5 via `golang.org/x/net/proxy` with optional `user:pass` auth) to weed out dead nodes, followed by dual-endpoint probing through each proxy's own transport.
 * **Auto-Discovery of Geolocation:** Discovers proxy exit countries on-the-fly using Cloudflare's trace diagnostic endpoint without external GeoIP databases.
 * **Continuous Time-Normalized Scoring ($\Delta t$):** Immunity against rapid refresh spam and long pauses; reputation scales strictly with elapsed observation time.
 * **Grace Buffering for Veteran Proxies:** A reputation credit system shields reliable servers from being exiled over transient network drops or short outages.
@@ -110,7 +110,7 @@ func (s *MyAPISource) FetchList() []string {
 
 When an empty slice is returned, the pool bypasses ingestion and evaluates only local proxies due for health checks or revivals.
 
-Incoming raw URLs are automatically canonicalized by the pool (enforcing lowercase schemes, stripping trailing slashes, and extracting standard `host:port`), ensuring deduplication across multiple sources.
+Incoming raw URLs are automatically canonicalized by the pool (lowercase `http`/`https`/`socks4`/`socks5` schemes, preserved `user[:pass]@` credentials, default ports 80/443/1080, and standard `host:port` extraction), ensuring deduplication across multiple sources.
 
 ---
 
@@ -156,9 +156,11 @@ The engine uses several targeted techniques to stabilize this environment:
 
 ### 1. Two-Phase Dual-Endpoint Probing
 
-1. **Phase 1: TCP CONNECT Handshake (Fast Filter)**  
-   Attempts a raw TCP tunnel handshake to `1.1.1.1:443` with a strict 4-second timeout. Reads the first status line (`HTTP/1.x 2xx`) from a stack-allocated buffer without heap allocations or TLS overhead. Fails dead nodes in milliseconds.
-2. **Phase 2: Dual-Endpoint HTTP Probe**  
+Supported proxy schemes: `http`, `https`, `socks4` (`socks4a` canonicalizes to `socks4` with remote hostname resolution), `socks5`. Credentials embedded as `user[:pass]@` apply to every scheme. Omitted ports default to 80 / 443 / 1080 (SOCKS).
+
+1. **Phase 1: Tunnel Handshake (Fast Filter)**
+   Attempts a tunnel to `1.1.1.1:443` through the proxy with a strict 4-second timeout: a raw TCP `CONNECT` handshake for HTTP/S (first status line read from a stack-allocated buffer without heap allocations or TLS overhead), a SOCKS4 `CONNECT` request expecting grant `0x5A`, or a SOCKS5 `CONNECT` (RFC 1928, RFC 1929 auth when userinfo is present). Fails dead nodes in milliseconds.
+2. **Phase 2: Dual-Endpoint Probe**  
    * **If `Location == ""` (New Node):** Probes `https://www.cloudflare.com/cdn-cgi/trace`. Measures real HTTPS round-trip time and parses `loc=XX` to discover the exit country.
    * **If `Location != ""` (Known Node):** Probes `http://cp.cloudflare.com/generate_204`. A zero-body HTTP 204 check that updates latency and uptime scores with minimal bandwidth.
 
