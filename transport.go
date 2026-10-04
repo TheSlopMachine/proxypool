@@ -22,15 +22,15 @@ type parsedProxy struct {
 
 // parseProxyURL normalizes raw and splits out scheme, address, and credentials.
 func parseProxyURL(raw string) (parsedProxy, error) {
-	canonical, host, port, err := normalizeProxyURL(raw)
+	ep, err := normalizeProxyURL(raw)
 	if err != nil {
 		return parsedProxy{}, err
 	}
-	u, err := url.Parse(canonical)
+	u, err := url.Parse(ep.Canonical)
 	if err != nil {
 		return parsedProxy{}, err
 	}
-	p := parsedProxy{scheme: u.Scheme, host: host, port: port}
+	p := parsedProxy{scheme: u.Scheme, host: ep.Host, port: ep.Port}
 	if u.User != nil {
 		p.username = u.User.Username()
 		p.password, _ = u.User.Password()
@@ -60,18 +60,20 @@ func TransportFor(proxyURL string, timeout time.Duration) (*http.Transport, erro
 		return nil, err
 	}
 	transport := &http.Transport{
-		DisableKeepAlives:       true,
-		ResponseHeaderTimeout:   timeout,
-		TLSHandshakeTimeout:     timeout,
-		ExpectContinueTimeout:   1 * time.Second,
-		IdleConnTimeout:         30 * time.Second,
-		MaxIdleConns:            0,
-		DisableCompression:      false,
+		// DisableKeepAlives forces a fresh socket per probe: no idle pool,
+		// so TIME_WAIT churn (not pool exhaustion) is the scaling limit.
+		DisableKeepAlives: true,
+		// All three bound a distinct stall phase; none may stay zero.
+		// TLSHandshakeTimeout was the 2.6h hang (default 0 = infinite).
+		ResponseHeaderTimeout: timeout,
+		TLSHandshakeTimeout:   timeout,
 		DialContext: (&net.Dialer{
 			Timeout: timeout,
 		}).DialContext,
 	}
 	switch p.scheme {
+	// Exhaustive over SupportedSchemes (parseProxyURL rejects the rest,
+	// so default is unreachable defense).
 	case "http", "https":
 		parsed, err := url.Parse(proxyURL)
 		if err != nil {
@@ -92,7 +94,9 @@ func TransportFor(proxyURL string, timeout time.Duration) (*http.Transport, erro
 // absolute conn deadline over the whole handshake so tarpits that accept TCP
 // but never answer fail within timeout instead of parking a worker forever.
 func (p parsedProxy) dialContext(timeout time.Duration) func(context.Context, string, string) (net.Conn, error) {
-	return func(ctx context.Context, network, target string) (net.Conn, error) {
+	// _ string is the network ("tcp"): required by http.Transport's
+	// DialContext signature; SOCKS always dials tcp.
+	return func(ctx context.Context, _ string, target string) (net.Conn, error) {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
@@ -100,7 +104,7 @@ func (p parsedProxy) dialContext(timeout time.Duration) func(context.Context, st
 		if p.scheme == "socks5" {
 			return p.dialSOCKS5(ctx, target, effective)
 		}
-		return dialSOCKS4(ctx, p.address(), target, p.username, effective)
+		return p.dialSOCKS4(ctx, target, effective)
 	}
 }
 
@@ -120,18 +124,28 @@ func effectiveTimeout(ctx context.Context, timeout time.Duration) time.Duration 
 	return timeout
 }
 
+// parseTarget splits a "host:port" dial target with port range validation,
+// shared by the SOCKS4/5 handshakes.
+func parseTarget(target string) (host string, port int, err error) {
+	host, portStr, err := net.SplitHostPort(target)
+	if err != nil {
+		return "", 0, fmt.Errorf("invalid target %q: %w", target, err)
+	}
+	port, err = strconv.Atoi(portStr)
+	if err != nil || port <= 0 || port > 65535 {
+		return "", 0, fmt.Errorf("invalid target port: %s", portStr)
+	}
+	return host, port, nil
+}
+
 // dialSOCKS5 opens target through the SOCKS5 proxy (RFC 1928), with optional
 // username/password authentication (RFC 1929). The entire exchange runs
 // under an absolute conn deadline derived from timeout, so half-open
 // proxies fail fast. Deadline is cleared before returning a usable conn.
 func (p parsedProxy) dialSOCKS5(ctx context.Context, target string, timeout time.Duration) (net.Conn, error) {
-	host, portStr, err := net.SplitHostPort(target)
+	host, port, err := parseTarget(target)
 	if err != nil {
-		return nil, fmt.Errorf("invalid target %q: %w", target, err)
-	}
-	port, err := strconv.Atoi(portStr)
-	if err != nil || port <= 0 || port > 65535 {
-		return nil, fmt.Errorf("invalid target port: %s", portStr)
+		return nil, err
 	}
 
 	dialer := &net.Dialer{Timeout: timeout}
@@ -139,12 +153,13 @@ func (p parsedProxy) dialSOCKS5(ctx context.Context, target string, timeout time
 	if err != nil {
 		return nil, err
 	}
-	deadline := time.Now().Add(timeout)
-	_ = conn.SetDeadline(deadline)
-
 	fail := func(err error) (net.Conn, error) {
 		conn.Close()
 		return nil, err
+	}
+	// A failed deadline silently removes hang protection: fail fast instead.
+	if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
+		return fail(err)
 	}
 
 	// Greeting: VER=0x05, methods (0x00 no-auth, plus 0x02 if credentials).
@@ -158,7 +173,7 @@ func (p parsedProxy) dialSOCKS5(ctx context.Context, target string, timeout time
 		return fail(err)
 	}
 	methodReply := make([]byte, 2)
-	if _, err := readFullCtx(ctx, conn, methodReply); err != nil {
+	if err := readFullCtx(ctx, conn, methodReply); err != nil {
 		return fail(err)
 	}
 	if methodReply[0] != 0x05 {
@@ -184,7 +199,7 @@ func (p parsedProxy) dialSOCKS5(ctx context.Context, target string, timeout time
 			return fail(err)
 		}
 		authReply := make([]byte, 2)
-		if _, err := readFullCtx(ctx, conn, authReply); err != nil {
+		if err := readFullCtx(ctx, conn, authReply); err != nil {
 			return fail(err)
 		}
 		if authReply[1] != 0x00 {
@@ -216,7 +231,7 @@ func (p parsedProxy) dialSOCKS5(ctx context.Context, target string, timeout time
 
 	// CONNECT reply: VER REP RSV ATYP BND.ADDR BND.PORT.
 	hdr := make([]byte, 4)
-	if _, err := readFullCtx(ctx, conn, hdr); err != nil {
+	if err := readFullCtx(ctx, conn, hdr); err != nil {
 		return fail(err)
 	}
 	if hdr[0] != 0x05 {
@@ -233,7 +248,7 @@ func (p parsedProxy) dialSOCKS5(ctx context.Context, target string, timeout time
 		addrLen = 16
 	case 0x03:
 		ln := make([]byte, 1)
-		if _, err := readFullCtx(ctx, conn, ln); err != nil {
+		if err := readFullCtx(ctx, conn, ln); err != nil {
 			return fail(err)
 		}
 		addrLen = int(ln[0])
@@ -241,7 +256,7 @@ func (p parsedProxy) dialSOCKS5(ctx context.Context, target string, timeout time
 		return fail(fmt.Errorf("socks5 bad atyp 0x%02x", hdr[3]))
 	}
 	rest := make([]byte, addrLen+2)
-	if _, err := readFullCtx(ctx, conn, rest); err != nil {
+	if err := readFullCtx(ctx, conn, rest); err != nil {
 		return fail(err)
 	}
 	_ = conn.SetDeadline(time.Time{})
@@ -250,22 +265,22 @@ func (p parsedProxy) dialSOCKS5(ctx context.Context, target string, timeout time
 
 // dialSOCKS4 opens target through the SOCKS4 proxy. Hostnames resolve
 // remotely (SOCKS4a framing: 0.0.0.x marker plus domain suffix).
-func dialSOCKS4(ctx context.Context, proxyAddr, target, username string, timeout time.Duration) (net.Conn, error) {
-	host, portStr, err := net.SplitHostPort(target)
-	if err != nil {
-		return nil, fmt.Errorf("invalid target %q: %w", target, err)
-	}
-	port, err := strconv.Atoi(portStr)
-	if err != nil || port <= 0 || port > 65535 {
-		return nil, fmt.Errorf("invalid target port: %s", portStr)
-	}
-
-	dialer := &net.Dialer{Timeout: timeout}
-	conn, err := dialer.DialContext(ctx, "tcp", proxyAddr)
+func (p parsedProxy) dialSOCKS4(ctx context.Context, target string, timeout time.Duration) (net.Conn, error) {
+	host, port, err := parseTarget(target)
 	if err != nil {
 		return nil, err
 	}
-	_ = conn.SetDeadline(time.Now().Add(timeout))
+
+	dialer := &net.Dialer{Timeout: timeout}
+	conn, err := dialer.DialContext(ctx, "tcp", p.address())
+	if err != nil {
+		return nil, err
+	}
+	// A failed deadline silently removes hang protection: fail fast instead.
+	if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
+		conn.Close()
+		return nil, err
+	}
 
 	req := []byte{0x04, 0x01, byte(port >> 8), byte(port)}
 	domain := ""
@@ -275,7 +290,7 @@ func dialSOCKS4(ctx context.Context, proxyAddr, target, username string, timeout
 		req = append(req, 0, 0, 0, 1)
 		domain = host
 	}
-	req = append(req, username...)
+	req = append(req, p.username...)
 	req = append(req, 0x00)
 	if domain != "" {
 		req = append(req, domain...)
@@ -287,7 +302,7 @@ func dialSOCKS4(ctx context.Context, proxyAddr, target, username string, timeout
 	}
 
 	reply := make([]byte, 8)
-	if _, err := readFullCtx(ctx, conn, reply); err != nil {
+	if err := readFullCtx(ctx, conn, reply); err != nil {
 		conn.Close()
 		return nil, err
 	}
@@ -300,35 +315,28 @@ func dialSOCKS4(ctx context.Context, proxyAddr, target, username string, timeout
 }
 
 // readFull reads exactly len(buf) bytes.
-func readFull(conn net.Conn, buf []byte) (int, error) {
+func readFull(conn net.Conn, buf []byte) error {
 	total := 0
 	for total < len(buf) {
 		n, err := conn.Read(buf[total:])
 		total += n
 		if err != nil {
-			return total, err
+			return err
 		}
 	}
-	return total, nil
+	return nil
 }
 
-// readFullCtx reads exactly len(buf) bytes, aborting early if ctx is done.
-// The conn deadline normally fires first; this is a second guard so a
-// cancelled request context (http.Client.Timeout) never parks a worker.
-func readFullCtx(ctx context.Context, conn net.Conn, buf []byte) (int, error) {
-	type result struct {
-		n   int
-		err error
+// readFullCtx reads exactly len(buf) bytes. The caller holds an absolute
+// conn deadline over the whole handshake, which is the actual bound; the
+// ctx checks are only early exits so an already-cancelled context (e.g.
+// http.Client.Timeout) never parks a worker. No goroutine per read.
+func readFullCtx(ctx context.Context, conn net.Conn, buf []byte) error {
+	if err := ctx.Err(); err != nil {
+		return err
 	}
-	done := make(chan result, 1)
-	go func() {
-		n, err := readFull(conn, buf)
-		done <- result{n: n, err: err}
-	}()
-	select {
-	case <-ctx.Done():
-		return 0, ctx.Err()
-	case r := <-done:
-		return r.n, r.err
+	if err := readFull(conn, buf); err != nil {
+		return err
 	}
+	return ctx.Err()
 }

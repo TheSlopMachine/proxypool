@@ -6,7 +6,7 @@ A high-performance, modular Go proxy pool library designed for public and privat
 
 ## Features
 
-* **Two-Phase Fast Verification:** Per-protocol tunnel handshakes (raw `CONNECT` for HTTP/S, in-house SOCKS4/4a, SOCKS5 via `golang.org/x/net/proxy` with optional `user:pass` auth) to weed out dead nodes, followed by dual-endpoint probing through each proxy's own transport.
+* **Two-Phase Fast Verification:** Per-protocol tunnel handshakes (raw `CONNECT` for HTTP/S, in-house deadline-bounded SOCKS4/4a and SOCKS5 with optional `user:pass` auth) to weed out dead nodes, followed by dual-endpoint probing through each proxy's own transport.
 * **Auto-Discovery of Geolocation:** Discovers proxy exit countries on-the-fly using Cloudflare's trace diagnostic endpoint without external GeoIP databases.
 * **Continuous Time-Normalized Scoring ($\Delta t$):** Immunity against rapid refresh spam and long pauses; reputation scales strictly with elapsed observation time.
 * **Grace Buffering for Veteran Proxies:** A reputation credit system shields reliable servers from being exiled over transient network drops or short outages.
@@ -140,11 +140,24 @@ Instead of binding to a rigid logging framework, the pool exposes structured tel
 type RefreshReporter interface {
 	ReportProxy(report ProxyReport)
 	Report(report RefreshReport)
+	ReportProgress(report RefreshProgressReport)
 }
 ```
 
 * `ReportProxy`: Emits per-proxy evaluation events (`Died`, `Revived`, current score/penalty, latency).
 * `Report`: Emits aggregated cycle statistics (min/max/median latency, average health score, cycle duration, alive counts).
+* `ReportProgress`: Emits in-cycle progress (`Completed`/`Total` raw counts plus `Elapsed` since cycle start, every 5000 completions and on completion). Derive display percent from `Completed`/`Total`; the pool never precomputes it.
+
+### 4. `TimeoutConfig` Contract
+
+Network budgets live in one struct — the single source of truth (defaults: 3s handshake, 5s probe, 1000 workers):
+
+```go
+pool.SetTimeout(proxypool.TimeoutConfig{Handshake: 3 * time.Second, Probe: 5 * time.Second})
+pool.SetConcurrency(1000)
+```
+
+Supported schemes are centralized too: feeds filter with `proxypool.IsSupportedScheme` (`SupportedSchemes()` lists the canonical set; `socks4a` canonicalizes to `socks4`).
 
 ---
 

@@ -110,6 +110,70 @@ type ProxySource interface {
 	FetchList() []string // Returns raw proxy URLs; empty slice means no changes (e.g., 304)
 }
 
+// DefaultConcurrency caps concurrent probe workers. 1000 sustains ~55k
+// probes in <10min (51515/1000*5s≈257s worst-case) on stock Windows
+// without exhausting the default 16k ephemeral ports.
+const DefaultConcurrency = 1000
+
+// TimeoutConfig bounds the two probe phases independently. It is the single
+// source of truth for network budgets: NewPool seeds it, SetTimeout replaces
+// it, Refresh snapshots it, and the pipeline consumes the resolved copy.
+// No other literal timeout defaults may exist elsewhere.
+type TimeoutConfig struct {
+	Handshake time.Duration // Phase-1 TCP/CONNECT/SOCKS greeting filter
+	Probe     time.Duration // Phase-2 HTTP/TLS exchange
+}
+
+// DefaultTimeoutConfig returns the stock-Windows-safe budgets: a fast 3s
+// handshake filter plus a 5s full HTTP/TLS probe.
+func DefaultTimeoutConfig() TimeoutConfig {
+	return TimeoutConfig{Handshake: 3 * time.Second, Probe: 5 * time.Second}
+}
+
+// Resolve fills any non-positive field with its default. It never mutates
+// the receiver; the zero value resolves to all defaults.
+func (c TimeoutConfig) Resolve() TimeoutConfig {
+	def := DefaultTimeoutConfig()
+	if c.Handshake <= 0 {
+		c.Handshake = def.Handshake
+	}
+	if c.Probe <= 0 {
+		c.Probe = def.Probe
+	}
+	return c
+}
+
+// PipelineConfig carries one refresh cycle's execution inputs. Refresh
+// snapshots pool state into it; executePipeline consumes the resolved copy.
+// Now is the UTC record timestamp for report fields; CycleStart is the raw
+// monotonic-bearing time.Now() used only for Elapsed.
+type PipelineConfig struct {
+	Concurrency int
+	Timeouts    TimeoutConfig
+	Now         time.Time
+	CycleStart  time.Time
+	Reporter    RefreshReporter
+}
+
+// Resolve fills every unset field with its default. It never mutates the
+// receiver; the zero value resolves to a fully usable config.
+func (c PipelineConfig) Resolve() PipelineConfig {
+	if c.Concurrency <= 0 {
+		c.Concurrency = DefaultConcurrency
+	}
+	c.Timeouts = c.Timeouts.Resolve()
+	if c.CycleStart.IsZero() {
+		c.CycleStart = time.Now()
+	}
+	if c.Now.IsZero() {
+		c.Now = c.CycleStart
+	}
+	if c.Reporter == nil {
+		c.Reporter = &noopReporter{}
+	}
+	return c
+}
+
 // RefreshProgressReport carries raw in-cycle progress; the reporter derives
 // any display percent from Completed/Total.
 type RefreshProgressReport struct {
@@ -129,6 +193,6 @@ type RefreshReporter interface {
 // noopReporter ensures safe execution when no custom reporter is registered.
 type noopReporter struct{}
 
-func (n *noopReporter) ReportProxy(_ ProxyReport)    {}
-func (n *noopReporter) Report(_ RefreshReport)       {}
+func (n *noopReporter) ReportProxy(_ ProxyReport)              {}
+func (n *noopReporter) Report(_ RefreshReport)                 {}
 func (n *noopReporter) ReportProgress(_ RefreshProgressReport) {}

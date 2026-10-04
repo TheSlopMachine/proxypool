@@ -11,28 +11,24 @@ import (
 
 // ProxyPool coordinates proxy discovery, lifecycle health, and consumer queries.
 type ProxyPool struct {
-	mu               sync.RWMutex
-	cache            CacheSource
-	sources          []ProxySource
-	reporter         RefreshReporter
-	checkTimeout     time.Duration
-	handshakeTimeout time.Duration
-	probeTimeout     time.Duration
-	concurrency      int
+	mu          sync.RWMutex
+	cache       CacheSource
+	sources     []ProxySource
+	reporter    RefreshReporter
+	timeouts    TimeoutConfig
+	concurrency int
 }
 
-// Stock-Windows-safe defaults: 1000 workers sustain ~55k probes in <10min
-// (51515/1000*5s≈257s worst-case) without exhausting the default 16k
-// ephemeral ports. Handshake is a fast 3s filter; the full HTTP/TLS probe
-// gets 5s. See transport.go for why every phase must be deadline-bounded.
+// NewPool initializes a pool with stock-Windows-safe defaults
+// (DefaultConcurrency workers, DefaultTimeoutConfig budgets) and default
+// in-memory storage with no-op reporting. See transport.go for why every
+// network phase must be deadline-bounded.
 func NewPool() *ProxyPool {
 	pool := &ProxyPool{
-		sources:          make([]ProxySource, 0),
-		checkTimeout:     5 * time.Second,
-		handshakeTimeout: 3 * time.Second,
-		probeTimeout:     5 * time.Second,
-		concurrency:      1000,
-		reporter:         &noopReporter{},
+		sources:     make([]ProxySource, 0),
+		timeouts:    DefaultTimeoutConfig(),
+		concurrency: DefaultConcurrency,
+		reporter:    &noopReporter{},
 	}
 	pool.RegisterCacheSource(newMemoryCache())
 	return pool
@@ -88,35 +84,13 @@ func (p *ProxyPool) SetConcurrency(n int) {
 	}
 }
 
-// SetTimeout configures the network timeout for handshakes and latency probes.
-// Kept for backward compatibility: sets both phases to d.
-// Prefer SetHandshakeTimeout/SetProbeTimeout for independent budgets.
-func (p *ProxyPool) SetTimeout(d time.Duration) {
+// SetTimeout replaces the network budgets for handshakes and latency
+// probes. A zero value resolves to all defaults via TimeoutConfig.Resolve;
+// to change one phase, pass the other through unchanged.
+func (p *ProxyPool) SetTimeout(c TimeoutConfig) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if d > 0 {
-		p.checkTimeout = d
-		p.handshakeTimeout = d
-		p.probeTimeout = d
-	}
-}
-
-// SetHandshakeTimeout bounds only the Phase-1 TCP/CONNECT/SOCKS greeting filter.
-func (p *ProxyPool) SetHandshakeTimeout(d time.Duration) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if d > 0 {
-		p.handshakeTimeout = d
-	}
-}
-
-// SetProbeTimeout bounds only the Phase-2 HTTP/TLS exchange.
-func (p *ProxyPool) SetProbeTimeout(d time.Duration) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if d > 0 {
-		p.probeTimeout = d
-	}
+	p.timeouts = c.Resolve()
 }
 
 // Refresh performs a verification cycle:
@@ -134,22 +108,9 @@ func (p *ProxyPool) Refresh() {
 	sources := append([]ProxySource(nil), p.sources...)
 	reporter := p.reporter
 	concurrency := p.concurrency
-	handshakeTimeout := p.handshakeTimeout
-	probeTimeout := p.probeTimeout
-	if handshakeTimeout <= 0 {
-		handshakeTimeout = p.checkTimeout
-	}
-	if probeTimeout <= 0 {
-		probeTimeout = p.checkTimeout
-	}
-	if handshakeTimeout <= 0 {
-		handshakeTimeout = 3 * time.Second
-	}
-	if probeTimeout <= 0 {
-		probeTimeout = 5 * time.Second
-	}
+	timeouts := p.timeouts.Resolve()
 	if concurrency <= 0 {
-		concurrency = 1000
+		concurrency = DefaultConcurrency
 	}
 	p.mu.RUnlock()
 
@@ -158,16 +119,16 @@ func (p *ProxyPool) Refresh() {
 	for _, src := range sources {
 		rawURLs := src.FetchList()
 		for _, raw := range rawURLs {
-			canonical, host, port, err := normalizeProxyURL(raw)
+			ep, err := normalizeProxyURL(raw)
 			if err != nil {
 				continue
 			}
-			if _, exists := cache.Get(canonical); !exists {
+			if _, exists := cache.Get(ep.Canonical); !exists {
 				totalNew++
 				cache.Set(ProxyState{
-					URL:           canonical,
-					IP:            host,
-					Port:          port,
+					URL:           ep.Canonical,
+					IP:            ep.Host,
+					Port:          ep.Port,
 					IsDead:        false,
 					Penalty:       0.0,
 					Score:         0.0,
@@ -199,41 +160,54 @@ func (p *ProxyPool) Refresh() {
 	// 3. Execution & Verification Pipeline
 	// startTime (raw time.Now) feeds Elapsed so progress reports measure the
 	// full cycle; now (UTC) stays the record timestamp.
-	updatedStates, proxyReports := executePipeline(candidates, concurrency, handshakeTimeout, probeTimeout, now, reporter, startTime)
+	outcomes := executePipeline(candidates, PipelineConfig{
+		Concurrency: concurrency,
+		Timeouts:    timeouts,
+		Now:         now,
+		CycleStart:  startTime,
+		Reporter:    reporter,
+	})
 
 	// 4. Persist Updates & Stream Proxy Reports
 	survivedCount := 0
 	diedCount := 0
 
-	for i, st := range updatedStates {
+	for _, outcome := range outcomes {
+		st := outcome.State
 		// The pipeline ran on a snapshot; a manual mark landing
 		// mid-cycle must survive this write-back.
 		if current, ok := cache.Get(st.URL); ok {
 			st = mergeManualMark(current, st)
 		}
 		cache.Set(st)
-		reporter.ReportProxy(proxyReports[i])
+		reporter.ReportProxy(outcome.Report)
 		if !st.IsDead {
 			survivedCount++
 		}
-		if proxyReports[i].Died {
+		if outcome.Report.Died {
 			diedCount++
 		}
 	}
 
-	// 5. Compute Cycle Telemetry Metrics across the Active Pool
+	// 5. Compute Cycle Telemetry Metrics across the Active Pool in one pass.
 	currentAlive := cache.All()
 	var activeLatencies []time.Duration
-	var activeScores []float64
-	var activePenalties []float64
 
 	aliveCount := 0
+	var scoreSum, penaltySum, maxScore, maxPenalty float64
 	for _, item := range currentAlive {
-		if !item.IsDead {
-			aliveCount++
-			activeLatencies = append(activeLatencies, item.Latency)
-			activeScores = append(activeScores, item.Score)
-			activePenalties = append(activePenalties, item.Penalty)
+		if item.IsDead {
+			continue
+		}
+		aliveCount++
+		activeLatencies = append(activeLatencies, item.Latency)
+		scoreSum += item.Score
+		penaltySum += item.Penalty
+		if item.Score > maxScore {
+			maxScore = item.Score
+		}
+		if item.Penalty > maxPenalty {
+			maxPenalty = item.Penalty
 		}
 	}
 
@@ -245,26 +219,10 @@ func (p *ProxyPool) Refresh() {
 		medLat = medianDuration(activeLatencies)
 	}
 
-	maxScore := 0.0
-	meanScore := 0.0
-	if len(activeScores) > 0 {
-		meanScore = meanFloat(activeScores)
-		for _, s := range activeScores {
-			if s > maxScore {
-				maxScore = s
-			}
-		}
-	}
-
-	maxPenalty := 0.0
-	meanPenalty := 0.0
-	if len(activePenalties) > 0 {
-		meanPenalty = meanFloat(activePenalties)
-		for _, p := range activePenalties {
-			if p > maxPenalty {
-				maxPenalty = p
-			}
-		}
+	meanScore, meanPenalty := 0.0, 0.0
+	if aliveCount > 0 {
+		meanScore = scoreSum / float64(aliveCount)
+		meanPenalty = penaltySum / float64(aliveCount)
 	}
 
 	// 6. Broadcast Aggregated Cycle Report

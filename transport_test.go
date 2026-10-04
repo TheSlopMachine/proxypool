@@ -80,7 +80,7 @@ func startSOCKS4Server(t *testing.T, grant bool, seen *[]string) string {
 				defer c.Close()
 				head := make([]byte, 8)
 				_ = c.SetReadDeadline(time.Now().Add(testTimeout))
-				if _, err := readFull(c, head); err != nil {
+				if err := readFull(c, head); err != nil {
 					return
 				}
 				userid := readNullString(c)
@@ -106,7 +106,7 @@ func readNullString(c net.Conn) string {
 	one := make([]byte, 1)
 	for len(out) < 256 {
 		_ = c.SetReadDeadline(time.Now().Add(testTimeout))
-		if _, err := readFull(c, one); err != nil {
+		if err := readFull(c, one); err != nil {
 			break
 		}
 		if one[0] == 0x00 {
@@ -136,11 +136,11 @@ func startSOCKS5Server(t *testing.T, requireAuth bool, user, pass string) string
 				defer c.Close()
 				_ = c.SetReadDeadline(time.Now().Add(testTimeout))
 				greet := make([]byte, 2)
-				if _, err := readFull(c, greet); err != nil {
+				if err := readFull(c, greet); err != nil {
 					return
 				}
 				methods := make([]byte, int(greet[1]))
-				if _, err := readFull(c, methods); err != nil {
+				if err := readFull(c, methods); err != nil {
 					return
 				}
 				if requireAuth {
@@ -162,24 +162,24 @@ func startSOCKS5Server(t *testing.T, requireAuth bool, user, pass string) string
 					_, _ = c.Write([]byte{0x05, 0x00})
 				}
 				head := make([]byte, 4)
-				if _, err := readFull(c, head); err != nil {
+				if err := readFull(c, head); err != nil {
 					return
 				}
 				switch head[3] {
 				case 0x01:
-					if _, err := readFull(c, make([]byte, 6)); err != nil {
+					if err := readFull(c, make([]byte, 6)); err != nil {
 						return
 					}
 				case 0x03:
 					ln := make([]byte, 1)
-					if _, err := readFull(c, ln); err != nil {
+					if err := readFull(c, ln); err != nil {
 						return
 					}
-					if _, err := readFull(c, make([]byte, int(ln[0])+2)); err != nil {
+					if err := readFull(c, make([]byte, int(ln[0])+2)); err != nil {
 						return
 					}
 				case 0x04:
-					if _, err := readFull(c, make([]byte, 18)); err != nil {
+					if err := readFull(c, make([]byte, 18)); err != nil {
 						return
 					}
 				default:
@@ -194,19 +194,19 @@ func startSOCKS5Server(t *testing.T, requireAuth bool, user, pass string) string
 
 func checkSOCKS5Auth(c net.Conn, user, pass string) bool {
 	head := make([]byte, 2)
-	if _, err := readFull(c, head); err != nil {
+	if err := readFull(c, head); err != nil {
 		return false
 	}
 	ulen := int(head[1])
 	rest := make([]byte, ulen+1)
-	if _, err := readFull(c, rest); err != nil {
+	if err := readFull(c, rest); err != nil {
 		_, _ = c.Write([]byte{0x01, 0x01})
 		return false
 	}
 	gotUser := string(rest[:ulen])
 	plen := int(rest[ulen])
 	pw := make([]byte, plen)
-	if _, err := readFull(c, pw); err != nil {
+	if err := readFull(c, pw); err != nil {
 		_, _ = c.Write([]byte{0x01, 0x01})
 		return false
 	}

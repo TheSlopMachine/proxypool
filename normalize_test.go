@@ -37,7 +37,7 @@ func TestNormalizeProxyURL(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			canonical, host, port, err := normalizeProxyURL(tc.raw)
+			ep, err := normalizeProxyURL(tc.raw)
 			if tc.wantErr {
 				if err == nil {
 					t.Fatalf("expected error for %q", tc.raw)
@@ -47,8 +47,8 @@ func TestNormalizeProxyURL(t *testing.T) {
 			if err != nil {
 				t.Fatalf("unexpected error for %q: %v", tc.raw, err)
 			}
-			if canonical != tc.canonical || host != tc.host || port != tc.port {
-				t.Fatalf("got %q/%q/%d, want %q/%q/%d", canonical, host, port, tc.canonical, tc.host, tc.port)
+			if ep.Canonical != tc.canonical || ep.Host != tc.host || ep.Port != tc.port {
+				t.Fatalf("got %q/%q/%d, want %q/%q/%d", ep.Canonical, ep.Host, ep.Port, tc.canonical, tc.host, tc.port)
 			}
 		})
 	}

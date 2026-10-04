@@ -19,14 +19,41 @@ var defaultPortByScheme = map[string]int{
 	"socks5": 1080,
 }
 
+// SupportedSchemes lists the proxy schemes the prober can handle, in
+// canonical form. "socks4a" is accepted as an alias and canonicalizes to
+// "socks4". Feeds filter against IsSupportedScheme; transports switch on
+// the canonical scheme.
+func SupportedSchemes() []string {
+	return []string{"http", "https", "socks4", "socks5"}
+}
+
+// IsSupportedScheme reports whether scheme names a probed protocol,
+// canonicalizing case and the socks4a alias.
+func IsSupportedScheme(scheme string) bool {
+	scheme = strings.ToLower(strings.TrimSpace(scheme))
+	if scheme == "socks4a" {
+		scheme = "socks4"
+	}
+	_, ok := defaultPortByScheme[scheme]
+	return ok
+}
+
+// ParsedEndpoint is a normalized proxy endpoint: canonical URL plus the
+// dial-relevant host and port.
+type ParsedEndpoint struct {
+	Canonical string // e.g. "socks5://user:pass@1.2.3.4:1080"
+	Host      string // target IP or hostname
+	Port      int    // target port
+}
+
 // normalizeProxyURL parses, normalizes, and extracts connection details.
 // Accepted schemes: http, https, socks4(+socks4a alias), socks5. Embedded
 // userinfo (user[:pass]@) is preserved in the canonical URL; socks4a
 // canonicalizes to socks4.
-func normalizeProxyURL(raw string) (canonicalURL string, host string, port int, err error) {
+func normalizeProxyURL(raw string) (ParsedEndpoint, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
-		return "", "", 0, errors.New("empty proxy URL")
+		return ParsedEndpoint{}, errors.New("empty proxy URL")
 	}
 
 	if !strings.Contains(raw, "://") {
@@ -35,7 +62,7 @@ func normalizeProxyURL(raw string) (canonicalURL string, host string, port int, 
 
 	u, err := url.Parse(raw)
 	if err != nil {
-		return "", "", 0, err
+		return ParsedEndpoint{}, err
 	}
 
 	scheme := strings.ToLower(u.Scheme)
@@ -44,25 +71,29 @@ func normalizeProxyURL(raw string) (canonicalURL string, host string, port int, 
 	}
 	defaultPort, ok := defaultPortByScheme[scheme]
 	if !ok {
-		return "", "", 0, fmt.Errorf("unsupported protocol: %s", scheme)
+		return ParsedEndpoint{}, fmt.Errorf("unsupported protocol: %s", scheme)
 	}
 
-	host = u.Hostname()
+	host := u.Hostname()
 	if host == "" {
-		return "", "", 0, fmt.Errorf("missing host: %s", raw)
+		return ParsedEndpoint{}, fmt.Errorf("missing host: %s", raw)
 	}
+	var port int
 	if portStr := u.Port(); portStr == "" {
 		port = defaultPort
 	} else if port, err = strconv.Atoi(portStr); err != nil || port <= 0 || port > 65535 {
-		return "", "", 0, fmt.Errorf("invalid port: %s", portStr)
+		return ParsedEndpoint{}, fmt.Errorf("invalid port: %s", portStr)
 	}
 
 	authority := net.JoinHostPort(host, strconv.Itoa(port))
 	if u.User != nil {
 		authority = u.User.String() + "@" + authority
 	}
-	canonicalURL = fmt.Sprintf("%s://%s", scheme, authority)
-	return canonicalURL, host, port, nil
+	return ParsedEndpoint{
+		Canonical: fmt.Sprintf("%s://%s", scheme, authority),
+		Host:      host,
+		Port:      port,
+	}, nil
 }
 
 // medianDuration returns the 50th percentile duration from a slice.
@@ -78,16 +109,4 @@ func medianDuration(vals []time.Duration) time.Duration {
 		return sorted[n/2]
 	}
 	return (sorted[n/2-1] + sorted[n/2]) / 2
-}
-
-// meanFloat calculates the arithmetic mean of a float slice.
-func meanFloat(vals []float64) float64 {
-	if len(vals) == 0 {
-		return 0.0
-	}
-	total := 0.0
-	for _, v := range vals {
-		total += v
-	}
-	return total / float64(len(vals))
 }

@@ -30,14 +30,11 @@ const (
 	monosansAllURL  = "https://cdn.jsdelivr.net/gh/monosans/proxy-list@main/proxies/all.txt"
 )
 
-// acceptedProtocols mirrors the plugin contract: rows outside this set count
-// as unsupported. The pool canonicalizes the rest (socks4a reads as socks4).
-var acceptedProtocols = map[string]bool{
-	"http":    true,
-	"https":   true,
-	"socks4":  true,
-	"socks4a": true,
-	"socks5":  true,
+// isAcceptedProtocol mirrors the plugin contract: rows outside the pool's
+// supported schemes count as unsupported. It delegates to the canonical
+// table so feeds and prober can never disagree (socks4a reads as socks4).
+func isAcceptedProtocol(scheme string) bool {
+	return proxypool.IsSupportedScheme(scheme)
 }
 
 // labSource is the status surface the reporter needs from every feed.
@@ -101,7 +98,13 @@ func (c *conditionalGet) Get(url string) ([]byte, int) {
 	}
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
-	if err != nil || len(body) == 0 {
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "feed %s: body read failed: %v\n", url, err)
+		c.status = 500
+		return nil, 500
+	}
+	if len(body) == 0 {
+		fmt.Fprintf(os.Stderr, "feed %s: empty body\n", url)
 		c.status = 500
 		return nil, 500
 	}
@@ -120,24 +123,24 @@ func (c *conditionalGet) LastStatus() int {
 // otherwise the first error status.
 func collapseStatus(statuses ...int) int {
 	fallback := 0
+	saw304 := false
 	for _, s := range statuses {
-		if s == 0 {
-			continue
-		}
-		if s == 200 {
+		switch {
+		case s == 200:
 			return 200
-		}
-		if s != 304 && fallback == 0 {
+		case s == 0:
+			continue
+		case s == 304:
+			saw304 = true
+		case fallback == 0:
 			fallback = s
 		}
 	}
 	if fallback != 0 {
 		return fallback
 	}
-	for _, s := range statuses {
-		if s == 304 {
-			return 304
-		}
+	if saw304 {
+		return 304
 	}
 	return 200
 }
@@ -166,12 +169,13 @@ func (s *ProxiflySource) FetchList() []string {
 		Protocol string `json:"protocol"`
 	}
 	if err := json.Unmarshal(body, &items); err != nil {
+		fmt.Fprintf(os.Stderr, "proxifly feed: dropped %d-byte malformed body: %v\n", len(body), err)
 		return nil
 	}
 
 	urls := make([]string, 0, len(items))
 	for _, item := range items {
-		if !acceptedProtocols[strings.ToLower(strings.TrimSpace(item.Protocol))] {
+		if !isAcceptedProtocol(item.Protocol) {
 			continue
 		}
 		if strings.TrimSpace(item.Proxy) == "" {
@@ -217,27 +221,19 @@ func (s *SpeedXSource) LastStatus() int {
 func (s *SpeedXSource) FetchList() []string {
 	// Fetch the 3 text feeds concurrently: sequential 3x30s worst-case
 	// becomes ~30s, well inside the 10min cycle budget.
-	type feedResult struct {
-		idx  int
-		urls []string
-	}
 	results := make([][]string, len(s.feeds))
 	var wg sync.WaitGroup
 	for i := range s.feeds {
 		wg.Add(1)
-		go func(idx int) {
+		go func() {
 			defer wg.Done()
-			f := &s.feeds[idx]
+			f := &s.feeds[i]
 			body, status := f.fetch.Get(f.url)
 			if status != http.StatusOK {
 				return
 			}
 			var urls []string
-			for _, line := range strings.Split(string(body), "\n") {
-				line = strings.TrimSpace(strings.ReplaceAll(line, "\r", ""))
-				if line == "" {
-					continue
-				}
+			for _, line := range cleanFeedLines(body) {
 				sep := strings.LastIndex(line, ":")
 				if sep <= 0 {
 					continue
@@ -249,18 +245,36 @@ func (s *SpeedXSource) FetchList() []string {
 				}
 				urls = append(urls, f.scheme+"://"+line)
 			}
-			results[idx] = urls
-		}(i)
+			results[i] = urls
+		}()
 	}
 	wg.Wait()
-	var urls []string
+	total := 0
+	for _, part := range results {
+		total += len(part)
+	}
+	if total == 0 {
+		return nil
+	}
+	urls := make([]string, 0, total)
 	for _, part := range results {
 		urls = append(urls, part...)
 	}
-	if len(urls) == 0 {
-		return nil
-	}
 	return urls
+}
+
+// cleanFeedLines splits a text feed body into non-empty trimmed lines,
+// shared by the SpeedX and Monosans parsers.
+func cleanFeedLines(body []byte) []string {
+	var lines []string
+	for _, line := range strings.Split(string(body), "\n") {
+		line = strings.TrimSpace(strings.ReplaceAll(line, "\r", ""))
+		if line == "" {
+			continue
+		}
+		lines = append(lines, line)
+	}
+	return lines
 }
 
 // MonosansSource serves the all-protocols text feed whose lines already
@@ -284,17 +298,13 @@ func (s *MonosansSource) FetchList() []string {
 	}
 
 	var urls []string
-	for _, line := range strings.Split(string(body), "\n") {
-		line = strings.TrimSpace(strings.ReplaceAll(line, "\r", ""))
-		if line == "" {
-			continue
-		}
+	for _, line := range cleanFeedLines(body) {
 		scheme, _, ok := strings.Cut(line, "://")
 		if !ok {
 			scheme = "http"
 			line = scheme + "://" + line
 		}
-		if !acceptedProtocols[strings.ToLower(scheme)] {
+		if !isAcceptedProtocol(scheme) {
 			continue
 		}
 		urls = append(urls, line)
@@ -323,6 +333,7 @@ type LabReporter struct {
 	nameCounter  int
 	diedNames    []string
 	revivedNames []string
+	writeErrs    int
 }
 
 func NewLabReporter(file *os.File, sources ...labSource) *LabReporter {
@@ -419,10 +430,16 @@ func (r *LabReporter) Report(report proxypool.RefreshReport) {
 	// Stream to stdout
 	fmt.Print(row)
 
-	// Write to table file and flush immediately
+	// Write to table file and flush immediately. Failures are loud:
+	// silent CSV loss was the original production symptom.
 	if r.tableFile != nil {
-		_, _ = r.tableFile.WriteString(row)
-		_ = r.tableFile.Sync()
+		if _, err := r.tableFile.WriteString(row); err != nil {
+			r.writeErrs++
+			fmt.Fprintf(os.Stderr, "table write failed (%d total): %v\n", r.writeErrs, err)
+		} else if err := r.tableFile.Sync(); err != nil {
+			r.writeErrs++
+			fmt.Fprintf(os.Stderr, "table sync failed (%d total): %v\n", r.writeErrs, err)
+		}
 	}
 
 	// Reset per-cycle collections
@@ -447,12 +464,19 @@ func generateName(idx int) string {
 		return string([]byte{c1, c2, c3})
 	}
 	// Fallback expansion for >17,575 items
-	var b []byte
-	for idx >= 0 {
-		b = append([]byte{byte('A' + (idx % 26))}, b...)
+	var sb strings.Builder
+	var rev []byte
+	for {
+		rev = append(rev, byte('A'+(idx%26)))
 		idx = (idx / 26) - 1
+		if idx < 0 {
+			break
+		}
 	}
-	return string(b)
+	for i := len(rev) - 1; i >= 0; i-- {
+		sb.WriteByte(rev[i])
+	}
+	return sb.String()
 }
 
 // ============================================================================
@@ -479,16 +503,21 @@ func main() {
 	// 2. Write CSV header if the file is brand new
 	fi, err := tableFile.Stat()
 	if err == nil && fi.Size() == 0 {
-		_, _ = tableFile.WriteString(csvHeader)
-		_ = tableFile.Sync()
+		if _, err := tableFile.WriteString(csvHeader); err != nil {
+			fmt.Fprintf(os.Stderr, "Fatal: failed to write CSV header: %v\n", err)
+			os.Exit(1)
+		}
+		if err := tableFile.Sync(); err != nil {
+			fmt.Fprintf(os.Stderr, "Fatal: failed to sync CSV header: %v\n", err)
+			os.Exit(1)
+		}
 		fmt.Print(csvHeader)
 	}
 
 	// 3. Setup proxy pool, embedded upstream sources, and reporter
 	pool := proxypool.NewPool()
 	pool.SetConcurrency(*concurrencyFlag)
-	pool.SetProbeTimeout(*timeoutFlag)
-	pool.SetHandshakeTimeout(*handshakeFlag)
+	pool.SetTimeout(proxypool.TimeoutConfig{Handshake: *handshakeFlag, Probe: *timeoutFlag})
 	// Feed client: whole-request 30s cap plus 10s TLS/header caps so a
 	// stalled CDN edge fails fast instead of blocking ingestion.
 	feedTransport := &http.Transport{

@@ -11,6 +11,7 @@ import (
 	"math/rand/v2"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -33,17 +34,16 @@ func verifyHandshake(ctx context.Context, proxyURL string, timeout time.Duration
 		return err
 	}
 	switch p.scheme {
+	// Exhaustive over SupportedSchemes (parseProxyURL rejects the rest,
+	// so default is unreachable defense).
 	case "http", "https":
 		return verifyHTTPHandshake(ctx, p.address(), timeout)
-	case "socks4":
-		conn, err := dialSOCKS4(ctx, p.address(), handshakeTarget, p.username, timeout)
-		if err != nil {
-			return err
+	case "socks4", "socks5":
+		dial := p.dialSOCKS4
+		if p.scheme == "socks5" {
+			dial = p.dialSOCKS5
 		}
-		conn.Close()
-		return nil
-	case "socks5":
-		conn, err := p.dialSOCKS5(ctx, handshakeTarget, timeout)
+		conn, err := dial(ctx, handshakeTarget, timeout)
 		if err != nil {
 			return err
 		}
@@ -67,7 +67,10 @@ func verifyHTTPHandshake(ctx context.Context, proxyAddr string, timeout time.Dur
 	}
 	defer conn.Close()
 
-	_ = conn.SetDeadline(time.Now().Add(timeout))
+	// A failed deadline silently removes hang protection: fail fast instead.
+	if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
+		return err
+	}
 
 	req := "CONNECT " + handshakeTarget + " HTTP/1.1\r\nHost: " + handshakeTarget + "\r\nProxy-Connection: close\r\n\r\n"
 	if _, err := io.WriteString(conn, req); err != nil {
@@ -103,19 +106,13 @@ func is2xxResponse(b []byte) bool {
 	if spaceIdx == -1 {
 		return false
 	}
-	for spaceIdx < len(b) && b[spaceIdx] == ' ' {
-		spaceIdx++
-	}
-	if spaceIdx+3 > len(b) {
+	fields := bytes.Fields(b[spaceIdx:])
+	if len(fields) == 0 || len(fields[0]) != 3 {
 		return false
 	}
-	code := 0
-	for i := 0; i < 3; i++ {
-		c := b[spaceIdx+i]
-		if c < '0' || c > '9' {
-			return false
-		}
-		code = code*10 + int(c-'0')
+	code, err := strconv.Atoi(string(fields[0]))
+	if err != nil {
+		return false
 	}
 	return code >= 200 && code < 300
 }
@@ -175,13 +172,27 @@ func probeEndpoint(ctx context.Context, proxyURI string, needLocation bool, time
 	return latency, discoveredLocation, nil
 }
 
+// deltaFor normalizes reputation movement by elapsed observation time:
+// immunity against rapid refresh spam and long pauses alike.
+func deltaFor(lastCheckedAt, now time.Time) float64 {
+	delta := 1.0
+	if !lastCheckedAt.IsZero() {
+		delta = math.Min(1.0, math.Max(0.01, now.Sub(lastCheckedAt).Minutes()))
+	}
+	return delta
+}
+
+// classifyRevival snapshots a candidate's pre-probe lifecycle position for
+// post-probe Died/Revived edge detection.
+func classifyRevival(item ProxyState, now time.Time) (wasDead, wasRevived bool) {
+	wasDead = item.IsDead
+	wasRevived = item.IsDead && !item.ReviveAt.IsZero() && !now.Before(item.ReviveAt)
+	return wasDead, wasRevived
+}
+
 // applySuccess updates state after passing handshake + latency check.
 func applySuccess(state *ProxyState, now time.Time, latency time.Duration, location string) {
-	delta := 1.0
-	if !state.LastCheckedAt.IsZero() {
-		elapsed := now.Sub(state.LastCheckedAt).Minutes()
-		delta = math.Min(1.0, math.Max(0.01, elapsed))
-	}
+	delta := deltaFor(state.LastCheckedAt, now)
 
 	state.Score = math.Min(10.0, state.Score+delta)
 	state.Penalty = math.Max(0.0, state.Penalty-delta)
@@ -197,11 +208,7 @@ func applySuccess(state *ProxyState, now time.Time, latency time.Duration, locat
 
 // applyFailure updates state and schedules a revival timestamp using jitter dispersion.
 func applyFailure(state *ProxyState, now time.Time) {
-	delta := 1.0
-	if !state.LastCheckedAt.IsZero() {
-		elapsed := now.Sub(state.LastCheckedAt).Minutes()
-		delta = math.Min(1.0, math.Max(0.01, elapsed))
-	}
+	delta := deltaFor(state.LastCheckedAt, now)
 
 	state.Penalty += delta
 	state.Score = math.Max(0.0, state.Score-delta)
@@ -222,34 +229,25 @@ func applyFailure(state *ProxyState, now time.Time) {
 	state.ReviveAt = now.Add(time.Duration(banMinutes * float64(time.Minute)))
 }
 
+// ProbeOutcome pairs a probed proxy's new state with its telemetry report.
+// The two stay index-aligned by construction: one outcome per candidate.
+type ProbeOutcome struct {
+	State  ProxyState
+	Report ProxyReport
+}
+
 // executePipeline coordinates concurrent Phase 1 (Handshake) and Phase 2 (Probe) checks.
-// Handshake and probe budgets are independent: handshakeTimeout bounds the
-// fast TCP/CONNECT/SOCKS greeting filter, probeTimeout bounds the full
-// HTTP/TLS exchange. Probe workers equal handshake workers (no /2 throttle)
-// so 1000-way concurrency sustains ~1000 dials without halving throughput
-// on stock Windows. Every wait is ctx/deadline-bounded; progress flows
-// through reporter every 5000 completions so silence means idleness,
-// not a parked pipeline.
-// cycleStart is the raw time.Now() from Refresh (monotonic-bearing) used
-// only for Elapsed; now is the UTC record timestamp for report fields.
-func executePipeline(candidates []ProxyState, concurrency int, handshakeTimeout, probeTimeout time.Duration, now time.Time, reporter RefreshReporter, cycleStart time.Time) ([]ProxyState, []ProxyReport) {
+// Handshake and probe budgets come from cfg.Timeouts: handshake bounds the
+// fast TCP/CONNECT/SOCKS greeting filter, probe bounds the full HTTP/TLS
+// exchange. Probe workers equal handshake workers (no /2 throttle) so
+// DefaultConcurrency-way concurrency sustains full dial throughput on stock
+// Windows. Every wait is ctx/deadline-bounded; progress flows through the
+// reporter every 5000 completions so silence means idleness, not a parked
+// pipeline.
+func executePipeline(candidates []ProxyState, cfg PipelineConfig) []ProbeOutcome {
+	cfg = cfg.Resolve()
 	if len(candidates) == 0 {
-		return nil, nil
-	}
-	if reporter == nil {
-		reporter = &noopReporter{}
-	}
-	if concurrency <= 0 {
-		concurrency = 1000
-	}
-	if handshakeTimeout <= 0 {
-		handshakeTimeout = 3 * time.Second
-	}
-	if probeTimeout <= 0 {
-		probeTimeout = 5 * time.Second
-	}
-	if cycleStart.IsZero() {
-		cycleStart = time.Now()
+		return nil
 	}
 
 	type probeResult struct {
@@ -264,7 +262,7 @@ func executePipeline(candidates []ProxyState, concurrency int, handshakeTimeout,
 	// ------------------------------------------------------------------------
 	// Phase 1: Fast TCP CONNECT Handshake
 	// ------------------------------------------------------------------------
-	handshakeWorkers := min(concurrency, len(candidates))
+	handshakeWorkers := min(cfg.Concurrency, len(candidates))
 	jobs := make(chan ProxyState, len(candidates))
 	handshakePassChan := make(chan ProxyState, len(candidates))
 	resultsChan := make(chan probeResult, len(candidates))
@@ -280,11 +278,10 @@ func executePipeline(candidates []ProxyState, concurrency int, handshakeTimeout,
 		go func() {
 			defer wgHandshake.Done()
 			for item := range jobs {
-				wasDead := item.IsDead
-				wasRevived := item.IsDead && !item.ReviveAt.IsZero() && !now.Before(item.ReviveAt)
+				wasDead, wasRevived := classifyRevival(item, cfg.Now)
 
-				hctx, cancel := context.WithTimeout(context.Background(), handshakeTimeout)
-				err := verifyHandshake(hctx, item.URL, handshakeTimeout)
+				hctx, cancel := context.WithTimeout(context.Background(), cfg.Timeouts.Handshake)
+				err := verifyHandshake(hctx, item.URL, cfg.Timeouts.Handshake)
 				cancel()
 				if err == nil {
 					handshakePassChan <- item
@@ -312,7 +309,7 @@ func executePipeline(candidates []ProxyState, concurrency int, handshakeTimeout,
 	// once SOCKS tarpits parked Phase-2 goroutines. Stock Windows sustains
 	// 1000 concurrent dials; TIME_WAIT churn stays safe because only the
 	// ~2% that pass the handshake hold a connected socket.
-	probeWorkers := max(1, min(concurrency, len(candidates)))
+	probeWorkers := max(1, min(cfg.Concurrency, len(candidates)))
 	var wgProbe sync.WaitGroup
 
 	for i := 0; i < probeWorkers; i++ {
@@ -320,12 +317,11 @@ func executePipeline(candidates []ProxyState, concurrency int, handshakeTimeout,
 		go func() {
 			defer wgProbe.Done()
 			for item := range handshakePassChan {
-				wasDead := item.IsDead
-				wasRevived := item.IsDead && !item.ReviveAt.IsZero() && !now.Before(item.ReviveAt)
+				wasDead, wasRevived := classifyRevival(item, cfg.Now)
 				needLocation := item.Location == ""
 
-				pctx, cancel := context.WithTimeout(context.Background(), probeTimeout)
-				lat, loc, err := probeEndpoint(pctx, item.URL, needLocation, probeTimeout)
+				pctx, cancel := context.WithTimeout(context.Background(), cfg.Timeouts.Probe)
+				lat, loc, err := probeEndpoint(pctx, item.URL, needLocation, cfg.Timeouts.Probe)
 				cancel()
 				if err == nil {
 					resultsChan <- probeResult{
@@ -356,8 +352,7 @@ func executePipeline(candidates []ProxyState, concurrency int, handshakeTimeout,
 	// ------------------------------------------------------------------------
 	// Aggregate State Mutations & Telemetry Reports
 	// ------------------------------------------------------------------------
-	updatedStates := make([]ProxyState, 0, len(candidates))
-	reports := make([]ProxyReport, 0, len(candidates))
+	outcomes := make([]ProbeOutcome, 0, len(candidates))
 
 	completed := 0
 	for res := range resultsChan {
@@ -365,12 +360,12 @@ func executePipeline(candidates []ProxyState, concurrency int, handshakeTimeout,
 		var died, revived bool
 
 		if res.success {
-			applySuccess(&st, now, res.latency, res.location)
+			applySuccess(&st, cfg.Now, res.latency, res.location)
 			if res.wasDead {
 				revived = true
 			}
 		} else {
-			applyFailure(&st, now)
+			applyFailure(&st, cfg.Now)
 			if !res.wasDead {
 				died = true
 			}
@@ -379,30 +374,32 @@ func executePipeline(candidates []ProxyState, concurrency int, handshakeTimeout,
 			}
 		}
 
-		updatedStates = append(updatedStates, st)
-		reports = append(reports, ProxyReport{
-			Timestamp: now,
-			URL:       st.URL,
-			Location:  st.Location,
-			IsDead:    st.IsDead,
-			Score:     st.Score,
-			Penalty:   st.Penalty,
-			ReviveAt:  st.ReviveAt,
-			Latency:   st.Latency,
-			Died:      died,
-			Revived:   revived,
+		outcomes = append(outcomes, ProbeOutcome{
+			State: st,
+			Report: ProxyReport{
+				Timestamp: cfg.Now,
+				URL:       st.URL,
+				Location:  st.Location,
+				IsDead:    st.IsDead,
+				Score:     st.Score,
+				Penalty:   st.Penalty,
+				ReviveAt:  st.ReviveAt,
+				Latency:   st.Latency,
+				Died:      died,
+				Revived:   revived,
+			},
 		})
 
 		completed++
 		if completed%5000 == 0 || completed == len(candidates) {
-			reporter.ReportProgress(RefreshProgressReport{
-				Timestamp: now,
+			cfg.Reporter.ReportProgress(RefreshProgressReport{
+				Timestamp: cfg.Now,
 				Completed: completed,
 				Total:     len(candidates),
-				Elapsed:   time.Since(cycleStart).Round(time.Second),
+				Elapsed:   time.Since(cfg.CycleStart).Round(time.Second),
 			})
 		}
 	}
 
-	return updatedStates, reports
+	return outcomes
 }
