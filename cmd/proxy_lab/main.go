@@ -4,10 +4,12 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"os/signal"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -17,82 +19,269 @@ import (
 )
 
 // ============================================================================
-// 1. Upstream Proxy Source (Proxifly with ETag / 304 support)
+// 1. Upstream Proxy Sources (native Go reissues of the plugin feeds)
 // ============================================================================
 
-type ProxiflySource struct {
-	url        string
-	etag       string
-	lastMod    string
-	lastStatus int
-	client     *http.Client
+const (
+	proxiflyAllURL  = "https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/all/data.json"
+	speedXHTTPURL   = "https://cdn.jsdelivr.net/gh/TheSpeedX/PROXY-List@master/http.txt"
+	speedXSOCKS4URL = "https://cdn.jsdelivr.net/gh/TheSpeedX/PROXY-List@master/socks4.txt"
+	speedXSOCKS5URL = "https://cdn.jsdelivr.net/gh/TheSpeedX/PROXY-List@master/socks5.txt"
+	monosansAllURL  = "https://cdn.jsdelivr.net/gh/monosans/proxy-list@main/proxies/all.txt"
+)
+
+// acceptedProtocols mirrors the plugin contract: rows outside this set count
+// as unsupported. The pool canonicalizes the rest (socks4a reads as socks4).
+var acceptedProtocols = map[string]bool{
+	"http":    true,
+	"https":   true,
+	"socks4":  true,
+	"socks4a": true,
+	"socks5":  true,
 }
 
-func NewProxiflySource(url string) *ProxiflySource {
-	return &ProxiflySource{
-		url:    url,
-		client: &http.Client{Timeout: 15 * time.Second},
-	}
+// labSource is the status surface the reporter needs from every feed.
+type labSource interface {
+	Name() string
+	LastStatus() int
 }
 
-func (s *ProxiflySource) Name() string { return "Proxifly-HTTP" }
-
-func (s *ProxiflySource) LastStatus() int {
-	if s.lastStatus == 0 {
-		return 200
-	}
-	return s.lastStatus
+// conditionalGet issues ETag/Last-Modified conditional requests against one
+// feed URL. A 304 returns no body; any non-200 returns no body either.
+type conditionalGet struct {
+	etag    string
+	lastMod string
+	status  int
+	client  *http.Client
 }
 
-func (s *ProxiflySource) FetchList() []string {
-	req, err := http.NewRequest("GET", s.url, nil)
+func (c *conditionalGet) Get(url string) ([]byte, int) {
+	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
-		s.lastStatus = 500
-		return nil
+		c.status = 500
+		return nil, 500
 	}
-	if s.etag != "" {
-		req.Header.Set("If-None-Match", s.etag)
+	if c.etag != "" {
+		req.Header.Set("If-None-Match", c.etag)
 	}
-	if s.lastMod != "" {
-		req.Header.Set("If-Modified-Since", s.lastMod)
+	if c.lastMod != "" {
+		req.Header.Set("If-Modified-Since", c.lastMod)
 	}
 
-	resp, err := s.client.Do(req)
+	resp, err := c.client.Do(req)
 	if err != nil {
-		s.lastStatus = 500
-		return nil
+		c.status = 500
+		return nil, 500
 	}
 	defer resp.Body.Close()
 
-	s.lastStatus = resp.StatusCode
+	c.status = resp.StatusCode
 	if resp.StatusCode == http.StatusNotModified {
-		return nil // 304 Not Modified
+		if v := resp.Header.Get("ETag"); v != "" {
+			c.etag = v
+		}
+		if v := resp.Header.Get("Last-Modified"); v != "" {
+			c.lastMod = v
+		}
+		return nil, http.StatusNotModified
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil
+		return nil, resp.StatusCode
 	}
 
-	s.etag = resp.Header.Get("ETag")
-	s.lastMod = resp.Header.Get("Last-Modified")
+	if v := resp.Header.Get("ETag"); v != "" {
+		c.etag = v
+	} else {
+		c.etag = ""
+	}
+	if v := resp.Header.Get("Last-Modified"); v != "" {
+		c.lastMod = v
+	} else {
+		c.lastMod = ""
+	}
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
+	if err != nil || len(body) == 0 {
+		c.status = 500
+		return nil, 500
+	}
+	return body, http.StatusOK
+}
+
+func (c *conditionalGet) LastStatus() int {
+	if c.status == 0 {
+		return 200
+	}
+	return c.status
+}
+
+// collapseStatus reduces several feed statuses to the single HTTP column:
+// 200 when any feed delivered fresh data, 304 when every feed stayed cached,
+// otherwise the first error status.
+func collapseStatus(statuses ...int) int {
+	fallback := 0
+	for _, s := range statuses {
+		if s == 0 {
+			continue
+		}
+		if s == 200 {
+			return 200
+		}
+		if s != 304 && fallback == 0 {
+			fallback = s
+		}
+	}
+	if fallback != 0 {
+		return fallback
+	}
+	for _, s := range statuses {
+		if s == 304 {
+			return 304
+		}
+	}
+	return 200
+}
+
+// ProxiflySource serves the all-protocols JSON feed with ETag / 304 support.
+type ProxiflySource struct {
+	fetch *conditionalGet
+}
+
+func NewProxiflySource(client *http.Client) *ProxiflySource {
+	return &ProxiflySource{fetch: &conditionalGet{client: client}}
+}
+
+func (s *ProxiflySource) Name() string { return "Proxifly" }
+
+func (s *ProxiflySource) LastStatus() int { return s.fetch.LastStatus() }
+
+func (s *ProxiflySource) FetchList() []string {
+	body, status := s.fetch.Get(proxiflyAllURL)
+	if status != http.StatusOK {
+		return nil
+	}
 
 	var items []struct {
 		Proxy    string `json:"proxy"`
 		Protocol string `json:"protocol"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&items); err != nil {
+	if err := json.Unmarshal(body, &items); err != nil {
 		return nil
 	}
 
 	urls := make([]string, 0, len(items))
 	for _, item := range items {
-		proto := strings.ToLower(strings.TrimSpace(item.Protocol))
-		if proto != "" && proto != "http" && proto != "https" {
+		if !acceptedProtocols[strings.ToLower(strings.TrimSpace(item.Protocol))] {
 			continue
 		}
-		if strings.HasPrefix(item.Proxy, "socks4://") || strings.HasPrefix(item.Proxy, "socks5://") {
+		if strings.TrimSpace(item.Proxy) == "" {
 			continue
 		}
 		urls = append(urls, item.Proxy)
+	}
+	return urls
+}
+
+// speedXFeed pairs one text feed URL with the scheme its bare host:port
+// lines stand for.
+type speedXFeed struct {
+	url    string
+	scheme string
+	fetch  *conditionalGet
+}
+
+// SpeedXSource serves the http/socks4/socks5 text feeds, each with its own
+// ETag / Last-Modified validators.
+type SpeedXSource struct {
+	feeds []speedXFeed
+}
+
+func NewSpeedXSource(client *http.Client) *SpeedXSource {
+	return &SpeedXSource{feeds: []speedXFeed{
+		{url: speedXHTTPURL, scheme: "http", fetch: &conditionalGet{client: client}},
+		{url: speedXSOCKS4URL, scheme: "socks4", fetch: &conditionalGet{client: client}},
+		{url: speedXSOCKS5URL, scheme: "socks5", fetch: &conditionalGet{client: client}},
+	}}
+}
+
+func (s *SpeedXSource) Name() string { return "SpeedX" }
+
+func (s *SpeedXSource) LastStatus() int {
+	statuses := make([]int, 0, len(s.feeds))
+	for _, f := range s.feeds {
+		statuses = append(statuses, f.fetch.LastStatus())
+	}
+	return collapseStatus(statuses...)
+}
+
+func (s *SpeedXSource) FetchList() []string {
+	var urls []string
+	for _, f := range s.feeds {
+		body, status := f.fetch.Get(f.url)
+		if status != http.StatusOK {
+			continue
+		}
+		for _, line := range strings.Split(string(body), "\n") {
+			line = strings.TrimSpace(strings.ReplaceAll(line, "\r", ""))
+			if line == "" {
+				continue
+			}
+			idx := strings.LastIndex(line, ":")
+			if idx <= 0 {
+				continue
+			}
+			host, portStr := line[:idx], line[idx+1:]
+			port, err := strconv.Atoi(portStr)
+			if strings.TrimSpace(host) == "" || err != nil || port < 1 || port > 65535 {
+				continue
+			}
+			urls = append(urls, f.scheme+"://"+line)
+		}
+	}
+	if len(urls) == 0 {
+		return nil
+	}
+	return urls
+}
+
+// MonosansSource serves the all-protocols text feed whose lines already
+// carry scheme://host:port endpoints.
+type MonosansSource struct {
+	fetch *conditionalGet
+}
+
+func NewMonosansSource(client *http.Client) *MonosansSource {
+	return &MonosansSource{fetch: &conditionalGet{client: client}}
+}
+
+func (s *MonosansSource) Name() string { return "Monosans" }
+
+func (s *MonosansSource) LastStatus() int { return s.fetch.LastStatus() }
+
+func (s *MonosansSource) FetchList() []string {
+	body, status := s.fetch.Get(monosansAllURL)
+	if status != http.StatusOK {
+		return nil
+	}
+
+	var urls []string
+	for _, line := range strings.Split(string(body), "\n") {
+		line = strings.TrimSpace(strings.ReplaceAll(line, "\r", ""))
+		if line == "" {
+			continue
+		}
+		scheme, _, ok := strings.Cut(line, "://")
+		if !ok {
+			scheme = "http"
+			line = scheme + "://" + line
+		}
+		if !acceptedProtocols[strings.ToLower(scheme)] {
+			continue
+		}
+		urls = append(urls, line)
+	}
+	if len(urls) == 0 {
+		return nil
 	}
 	return urls
 }
@@ -101,20 +290,26 @@ func (s *ProxiflySource) FetchList() []string {
 // 2. Metrics & Telemetry Reporter (CSV Streamer + 3-Letter Namer)
 // ============================================================================
 
+// maxNamesPerCell caps the DiedNames/RevivedNames columns for large pools;
+// the numeric Died/Revived columns keep the full counts.
+const maxNamesPerCell = 20
+
+const csvHeader = "Timestamp|HTTP|Total|New|Skip|Revive|Probed|Survived|Died|Alive|MinLat|MedLat|DiedNames|RevivedNames|MaxScore|AvgScore|MaxPenalty|AvgPenalty|Duration|SrcProxifly|SrcSpeedX|SrcMonosans\n"
+
 type LabReporter struct {
 	mu           sync.Mutex
 	tableFile    *os.File
-	source       *ProxiflySource
+	sources      []labSource
 	nameMap      map[string]string
 	nameCounter  int
 	diedNames    []string
 	revivedNames []string
 }
 
-func NewLabReporter(file *os.File, source *ProxiflySource) *LabReporter {
+func NewLabReporter(file *os.File, sources ...labSource) *LabReporter {
 	return &LabReporter{
 		tableFile: file,
-		source:    source,
+		sources:   sources,
 		nameMap:   make(map[string]string),
 	}
 }
@@ -138,28 +333,36 @@ func (r *LabReporter) ReportProxy(p proxypool.ProxyReport) {
 	}
 }
 
+// formatNames sorts the per-cycle names and caps the cell at maxNamesPerCell
+// entries with a single +N-more overflow token.
+func formatNames(names []string) string {
+	if len(names) == 0 {
+		return "-"
+	}
+	sort.Strings(names)
+	if len(names) > maxNamesPerCell {
+		overflow := len(names) - maxNamesPerCell
+		capped := make([]string, 0, maxNamesPerCell+1)
+		capped = append(capped, names[:maxNamesPerCell]...)
+		capped = append(capped, fmt.Sprintf("+%d-more", overflow))
+		names = capped
+	}
+	return strings.Join(names, " ")
+}
+
 func (r *LabReporter) Report(report proxypool.RefreshReport) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	sort.Strings(r.diedNames)
-	sort.Strings(r.revivedNames)
-
-	diedStr := strings.Join(r.diedNames, " ")
-	if diedStr == "" {
-		diedStr = "-"
+	statuses := make([]int, 0, len(r.sources))
+	for _, s := range r.sources {
+		statuses = append(statuses, s.LastStatus())
 	}
 
-	revivedStr := strings.Join(r.revivedNames, " ")
-	if revivedStr == "" {
-		revivedStr = "-"
-	}
-
-	// Format row strictly matching:
-	// Timestamp|HTTP|Total|New|Skip|Revive|Probed|Survived|Died|Alive|MinLat|MedLat|DiedNames|RevivedNames|MaxScore|AvgScore|MaxPenalty|AvgPenalty|Duration
-	row := fmt.Sprintf("%s|%d|%d|%d|%d|%d|%d|%d|%d|%d|%dms|%dms|%s|%s|%.2f|%.2f|%.2f|%.2f|%.2fs\n",
+	// Format row strictly matching csvHeader.
+	row := fmt.Sprintf("%s|%d|%d|%d|%d|%d|%d|%d|%d|%d|%dms|%dms|%s|%s|%.2f|%.2f|%.2f|%.2f|%.2fs|%s\n",
 		report.Timestamp.Format("2006-01-02 15:04:05"),
-		r.source.LastStatus(),
+		collapseStatus(statuses...),
 		report.ProxiesTotal,
 		report.ProxiesTotalNew,
 		report.ProxiesTotalSkipped,
@@ -170,13 +373,14 @@ func (r *LabReporter) Report(report proxypool.RefreshReport) {
 		report.ProxiesTotalAlive,
 		report.LatencyMinimum.Milliseconds(),
 		report.LatencyMedian.Milliseconds(),
-		diedStr,
-		revivedStr,
+		formatNames(r.diedNames),
+		formatNames(r.revivedNames),
 		report.ScoreMaximum,
 		report.ScoreAverage,
 		report.PenaltyMaximum,
 		report.PenaltyAverage,
 		report.Duration.Seconds(),
+		joinStatuses(statuses),
 	)
 
 	// Stream to stdout
@@ -191,6 +395,14 @@ func (r *LabReporter) Report(report proxypool.RefreshReport) {
 	// Reset per-cycle collections
 	r.diedNames = nil
 	r.revivedNames = nil
+}
+
+func joinStatuses(statuses []int) string {
+	parts := make([]string, 0, len(statuses))
+	for _, s := range statuses {
+		parts = append(parts, fmt.Sprintf("%d", s))
+	}
+	return strings.Join(parts, "|")
 }
 
 // generateName assigns 3-letter alphabetical names: 0->AAA, 1->AAB, ..., 17575->ZZZ
@@ -218,7 +430,6 @@ func main() {
 	intervalFlag := flag.Duration("interval", 15*time.Second, "Interval between refresh checks (e.g. 15s, 1m, 5m)")
 	samplesFlag := flag.Int("samples", 100, "How many samples to collect before exiting (0 for infinite)")
 	tableFlag := flag.String("table", "table.csv", "Path where to output pipe-separated CSV logs")
-	sourceURL := flag.String("source", "https://raw.githubusercontent.com/proxifly/free-proxy-list/refs/heads/main/proxies/protocols/http/data.json", "Upstream proxy JSON feed")
 	flag.Parse()
 
 	// 1. Open destination table file
@@ -231,19 +442,23 @@ func main() {
 
 	// 2. Write CSV header if the file is brand new
 	fi, err := tableFile.Stat()
-	header := "Timestamp|HTTP|Total|New|Skip|Revive|Probed|Survived|Died|Alive|MinLat|MedLat|DiedNames|RevivedNames|MaxScore|AvgScore|MaxPenalty|AvgPenalty|Duration\n"
 	if err == nil && fi.Size() == 0 {
-		_, _ = tableFile.WriteString(header)
+		_, _ = tableFile.WriteString(csvHeader)
 		_ = tableFile.Sync()
-		fmt.Print(header)
+		fmt.Print(csvHeader)
 	}
 
-	// 3. Setup proxy pool, upstream source, and reporter
+	// 3. Setup proxy pool, embedded upstream sources, and reporter
 	pool := proxypool.NewPool()
-	src := NewProxiflySource(*sourceURL)
-	pool.RegisterProxySource(src)
+	client := &http.Client{Timeout: 30 * time.Second}
+	proxifly := NewProxiflySource(client)
+	speedx := NewSpeedXSource(client)
+	monosans := NewMonosansSource(client)
+	pool.RegisterProxySource(proxifly)
+	pool.RegisterProxySource(speedx)
+	pool.RegisterProxySource(monosans)
 
-	reporter := NewLabReporter(tableFile, src)
+	reporter := NewLabReporter(tableFile, proxifly, speedx, monosans)
 	pool.RegisterReporter(reporter)
 
 	fmt.Fprintf(os.Stderr, "Proxy Lab started.\n -> Interval: %v\n -> Samples:  %d\n -> Table:    %s\n\n", *intervalFlag, *samplesFlag, *tableFlag)
