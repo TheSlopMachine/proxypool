@@ -67,6 +67,7 @@ func (p *ProxyPool) Snapshot() PoolStats {
 	}
 	stats.LastIngestAt = p.sched.lastIngestAt
 	p.sched.mu.Unlock()
+	stats.Demands = p.demands.snapshot(now)
 
 	for _, ss := range bySource {
 		ss.BanReasons = copyReasonMap(ss.BanReasons)

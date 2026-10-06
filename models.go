@@ -95,7 +95,7 @@ type NetState string // "good", "degraded", "down"
 // PoolEvent records a pool state transition.
 type PoolEvent struct {
 	Time   time.Time         // UTC timestamp of the event
-	Kind   string            // "mode_change", "net_change", "limit_change", "ingest_done", "breaker_open", "breaker_close"
+	Kind   string            // "mode_change", "net_change", "limit_change", "ingest_done", "breaker_open", "breaker_close", "demand_created", "demand_satisfied", "demand_expired", "require_timeout"
 	Fields map[string]string // Stringified details, e.g. {"from":"foreground","to":"background"}
 }
 
@@ -105,6 +105,16 @@ type NetSnapshot struct {
 	State     NetState      // "good", "degraded", "down"
 	RTT       time.Duration // Median of the last 3 successful samples, 0 if none
 	UpdatedAt time.Time     // UTC timestamp of the last sample
+}
+
+// DemandStat reports one registered country demand.
+type DemandStat struct {
+	Countries       []string // Sorted ISO codes; empty means any country
+	Waiters         int
+	Served          int64 // Proxies handed out through this demand
+	CreatedAt       time.Time
+	ExpiresAt       time.Time
+	LastSatisfiedAt time.Time
 }
 
 // SourceStats aggregates pool composition per source.
@@ -139,6 +149,7 @@ type PoolStats struct {
 	Sources      []SourceStats // Sorted by Source
 	BanReasons   map[FailReason]int
 	LastIngestAt time.Time
+	Demands      []DemandStat // Registered country demands, sorted by key
 }
 
 // ============================================================================

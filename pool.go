@@ -20,6 +20,7 @@ type ProxyPool struct {
 
 	limiter   *limiter
 	index     *aliveIndex
+	demands   *demandRegistry
 	sched     *scheduler
 	netHealth *netHealth
 	mode      atomic.Int32
@@ -69,8 +70,19 @@ func NewPool() *ProxyPool {
 			ingestReq: make(chan struct{}, 1),
 		},
 	}
+	pool.demands = newDemandRegistry()
+	pool.demands.onEvent = pool.reportEvent
+	pool.index.onAlive = pool.demands.notify
 	pool.RegisterCacheSource(newMemoryCache())
 	return pool
+}
+
+// reportEvent forwards one event to the currently registered reporter.
+func (p *ProxyPool) reportEvent(event PoolEvent) {
+	p.mu.RLock()
+	reporter := p.reporter
+	p.mu.RUnlock()
+	reporter.ReportEvent(event)
 }
 
 // RegisterCacheSource switches the storage backend and automatically migrates

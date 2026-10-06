@@ -168,6 +168,17 @@ Supported schemes are centralized too: feeds filter with `proxypool.IsSupportedS
 
 ---
 
+## Demands: `Require`
+
+`Require(ctx, RequireOptions)` hands out alive proxies for callers that need a specific exit country.
+
+- `Countries` is an OR list of ISO codes; empty accepts any country. Invalid codes return `ErrInvalidCountry`.
+- `Exclude` lists proxy URLs that are never returned to this caller. `Limit` caps the number of distinct proxies returned.
+- A matching alive proxy is returned immediately. Otherwise the call registers a demand and waits until a match becomes alive, `Timeout` (default `Config.RequireTimeout`, 60s) elapses, or `ctx` is done.
+- Timeout returns `TimedOut=true` with a nil error. The caller decides the fallback; the pool never falls back to a direct connection.
+- Waiters with the same country set share one demand. Cancelling `ctx` releases only the waiter; the demand stays registered for `Config.DemandTTL` (default 5m). `Config.MaxDemands` caps distinct demands (`ErrDemandLimit`).
+- Registered demands appear in `PoolStats.Demands`; `demand_created`, `demand_satisfied`, `demand_expired` and `require_timeout` are reported as `PoolEvent`s.
+
 ## The Mathematics & Design
 
 Public proxy lists exhibit extreme behavior: **~98% of scraped proxies are dead servers**, newly discovered proxies have a **75%+ first-minute mortality rate**, and fewer than **1% remain viable over 8+ hours**. 

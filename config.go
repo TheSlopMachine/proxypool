@@ -17,6 +17,12 @@ type Config struct {
 	NetProbeInterval time.Duration
 	NetDegradedRTT   time.Duration
 	SourceGCAge      time.Duration
+	// RequireTimeout is the default overall deadline of one Require call.
+	RequireTimeout time.Duration
+	// DemandTTL is how long a country demand stays registered after its last use.
+	DemandTTL time.Duration
+	// MaxDemands caps the number of distinct registered demands.
+	MaxDemands int
 }
 
 // DefaultConfig returns the scheduler defaults defined by the rollout plan.
@@ -35,6 +41,9 @@ func DefaultConfig() Config {
 		NetProbeInterval: 5 * time.Second,
 		NetDegradedRTT:   1500 * time.Millisecond,
 		SourceGCAge:      168 * time.Hour,
+		RequireTimeout:   60 * time.Second,
+		DemandTTL:        5 * time.Minute,
+		MaxDemands:       32,
 	}
 }
 
@@ -79,6 +88,15 @@ func (c Config) Resolve() Config {
 	}
 	if c.SourceGCAge <= 0 {
 		c.SourceGCAge = def.SourceGCAge
+	}
+	if c.RequireTimeout <= 0 {
+		c.RequireTimeout = def.RequireTimeout
+	}
+	if c.DemandTTL <= 0 {
+		c.DemandTTL = def.DemandTTL
+	}
+	if c.MaxDemands <= 0 {
+		c.MaxDemands = def.MaxDemands
 	}
 	if c.MinLimit > c.InitialLimit {
 		c.InitialLimit = c.MinLimit
