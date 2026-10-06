@@ -11,17 +11,27 @@ import (
 // ProxyState holds internal lifecycle, scoring, and operational metadata.
 // Stored inside CacheSource and managed solely by ProxyPool.
 type ProxyState struct {
-	URL           string            // Canonical proxy URL (e.g., "http://1.2.3.4:8080", "socks5://user:pass@1.2.3.4:1080")
-	IP            string            // Target IP or hostname
-	Port          int               // Target port
-	Location      string            // 2-letter ISO country code discovered via Cloudflare trace (e.g., "DE")
-	IsDead        bool              // Operational status
-	Penalty       float64           // Accumulated backoff penalty weight
-	Score         float64           // Reputation credit [0.0 - 10.0]
-	ReviveAt      time.Time         // Timestamp when dead proxy can be re-tested
-	LastCheckedAt time.Time         // Timestamp of last probe (used for delta normalization)
-	Latency       time.Duration     // Last measured round-trip time
-	Metadata      map[string]string // Optional user-attached custom metadata (nil = none)
+	URL      string // Canonical proxy URL (e.g., "http://1.2.3.4:8080", "socks5://user:pass@1.2.3.4:1080")
+	IP       string // Target IP or hostname
+	Port     int    // Target port
+	Location string // 2-letter ISO country code discovered via Cloudflare trace (e.g., "DE")
+	IsDead   bool   // Operational status
+	// Source is the name of the first source that reported this proxy.
+	Source string
+	// FailReason classifies the last failed check; empty when the last check passed.
+	FailReason FailReason
+	// SoftFails counts consecutive soft failures; reset on success.
+	SoftFails int
+	// Suspect excludes the proxy from listings and queues an immediate recheck.
+	Suspect bool
+	// LastSeenInSource is the last time any source reported this URL.
+	LastSeenInSource time.Time
+	Penalty          float64           // Accumulated backoff penalty weight
+	Score            float64           // Reputation credit [0.0 - 10.0]
+	ReviveAt         time.Time         // Timestamp when dead proxy can be re-tested
+	LastCheckedAt    time.Time         // Timestamp of last probe (used for delta normalization)
+	Latency          time.Duration     // Last measured round-trip time
+	Metadata         map[string]string // Optional user-attached custom metadata (nil = none)
 }
 
 // ProxyInfo represents a validated, consumer-ready proxy returned by ListProxies.
@@ -37,6 +47,12 @@ type ProxyInfo struct {
 
 // ProxyFilter defines search criteria used when querying the pool.
 // All fields are optional pointers; nil allows all values.
+// BanFilter selects banned proxies for manual revival checks. Empty fields match any value.
+type BanFilter struct {
+	Reason FailReason
+	Source string
+}
+
 type ProxyFilter struct {
 	Location   *string        // ISO country code (e.g., "DE", "US")
 	MaxLatency *time.Duration // Upper latency threshold
@@ -48,45 +64,81 @@ type ProxyFilter struct {
 // 2. Telemetry Models
 // ============================================================================
 
-// RefreshReport contains aggregated cycle statistics.
-type RefreshReport struct {
-	Timestamp            time.Time     // UTC timestamp when the refresh cycle started
-	Duration             time.Duration // Total execution duration of the cycle
-	ProxiesTotal         int           // Total known proxies in cache
-	ProxiesTotalNew      int           // New proxies discovered during this cycle
-	ProxiesTotalSkipped  int           // Dead proxies skipped (in backoff cooldown)
-	ProxiesTotalRevived  int           // Dead proxies that reached revive_at and were re-probed
-	ProxiesTotalProbed   int           // Candidates sent to verification
-	ProxiesTotalSurvived int           // Proxies that passed handshake and latency check
-	ProxiesTotalDied     int           // Previously alive proxies that failed this round
-	ProxiesTotalAlive    int           // Total working proxies currently in pool
-
-	// Latency (Active Pool)
-	LatencyMinimum time.Duration // Lowest active proxy latency
-	LatencyMaximum time.Duration // Highest active proxy latency
-	LatencyMedian  time.Duration // P50 latency (superior to mean for network RTT)
-
-	// Score (Active Pool, [0.0 - 10.0])
-	ScoreMaximum float64 // Highest score in pool
-	ScoreAverage float64 // Mean score (acts as general pool health index)
-
-	// Penalty (Active Pool)
-	PenaltyMaximum float64 // Highest residual penalty among active proxies
-	PenaltyAverage float64 // Mean residual penalty among active proxies
-}
-
 // ProxyReport contains telemetry for a single proxy evaluated during a cycle.
 type ProxyReport struct {
-	Timestamp time.Time     // UTC timestamp of the event
-	URL       string        // Normalized proxy URL
-	Location  string        // Discovered ISO country code
-	IsDead    bool          // Operational status after check
-	Score     float64       // Reputation score [0.0 - 10.0]
-	Penalty   float64       // Current backoff penalty weight
-	ReviveAt  time.Time     // Scheduled revival timestamp if dead
-	Latency   time.Duration // Measured latency during check (0 if failed/skipped)
-	Died      bool          // True if transitioned from Alive -> Dead
-	Revived   bool          // True if transitioned from Dead -> Probed/Alive
+	Timestamp  time.Time     // UTC timestamp of the event
+	URL        string        // Normalized proxy URL
+	Source     string        // Name of the source that first reported the proxy
+	Location   string        // Discovered ISO country code
+	FailReason FailReason    // Classification of the failed check; empty on success
+	Lane       string        // Scheduler lane that ran the check; empty before the lane scheduler
+	IsDead     bool          // Operational status after check
+	Score      float64       // Reputation score [0.0 - 10.0]
+	Penalty    float64       // Current backoff penalty weight
+	ReviveAt   time.Time     // Scheduled revival timestamp if dead
+	Latency    time.Duration // Measured latency during check (0 if failed/skipped)
+	Died       bool          // True if transitioned from Alive -> Dead
+	Revived    bool          // True if transitioned from Dead -> Probed/Alive
+}
+
+// Mode is the pool scheduling mode.
+type Mode string // "foreground", "background"
+
+const (
+	ModeForeground Mode = "foreground"
+	ModeBackground Mode = "background"
+)
+
+// NetState is the state of the local network connection of the host.
+type NetState string // "good", "degraded", "down"
+
+// PoolEvent records a pool state transition.
+type PoolEvent struct {
+	Time   time.Time         // UTC timestamp of the event
+	Kind   string            // "mode_change", "net_change", "limit_change", "ingest_done", "breaker_open", "breaker_close"
+	Fields map[string]string // Stringified details, e.g. {"from":"foreground","to":"background"}
+}
+
+// NetSnapshot is the last published network health sample. Defined here
+// because PoolStats references it; the publishing prober lives in nethealth.go.
+type NetSnapshot struct {
+	State     NetState      // "good", "degraded", "down"
+	RTT       time.Duration // Median of the last 3 successful samples, 0 if none
+	UpdatedAt time.Time     // UTC timestamp of the last sample
+}
+
+// SourceStats aggregates pool composition per source.
+type SourceStats struct {
+	Source     string
+	Alive      int
+	Suspect    int
+	Banned     int
+	Queued     int                // Candidates of this source still in the candidate queue
+	BanReasons map[FailReason]int // Among banned
+}
+
+// LaneStats reports one scheduler lane's load.
+type LaneStats struct {
+	Lane     string
+	Inflight int
+	Queued   int // Due items
+}
+
+// PoolStats is a point-in-time pool snapshot reported on StatsInterval.
+type PoolStats struct {
+	Time         time.Time
+	Mode         Mode
+	Net          NetSnapshot
+	Limit        int
+	Inflight     int
+	Alive        int
+	Suspect      int
+	Banned       int
+	Queued       int // Candidate queue length
+	Lanes        []LaneStats
+	Sources      []SourceStats // Sorted by Source
+	BanReasons   map[FailReason]int
+	LastIngestAt time.Time
 }
 
 // ============================================================================
@@ -99,6 +151,7 @@ type CacheSource interface {
 	Get(url string) (ProxyState, bool)
 	Set(state ProxyState)
 	All() []ProxyState
+	Delete(url string)
 	Clear()
 }
 
@@ -110,28 +163,30 @@ type ProxySource interface {
 	FetchList() []string // Returns raw proxy URLs; empty slice means no changes (e.g., 304)
 }
 
-// DefaultConcurrency caps concurrent probe workers. 1000 sustains ~55k
-// probes in <10min (51515/1000*5s≈257s worst-case) on stock Windows
-// without exhausting the default 16k ephemeral ports.
-const DefaultConcurrency = 1000
-
-// TimeoutConfig bounds the two probe phases independently. It is the single
-// source of truth for network budgets: NewPool seeds it, SetTimeout replaces
-// it, Refresh snapshots it, and the pipeline consumes the resolved copy.
-// No other literal timeout defaults may exist elsewhere.
-type TimeoutConfig struct {
-	Handshake time.Duration // Phase-1 TCP/CONNECT/SOCKS greeting filter
-	Probe     time.Duration // Phase-2 HTTP/TLS exchange
+// TaggedURL associates one source identity with a raw URL.
+type TaggedURL struct {
+	URL    string
+	Source string
 }
 
-// DefaultTimeoutConfig returns the stock-Windows-safe budgets: a fast 3s
-// handshake filter plus a 5s full HTTP/TLS probe.
+// TaggedSource optionally supplies per-URL source tags during ingest.
+type TaggedSource interface {
+	FetchTagged() []TaggedURL
+}
+
+// TimeoutConfig bounds the two probe phases independently. It is the single
+// source of truth for network budgets.
+type TimeoutConfig struct {
+	Handshake time.Duration
+	Probe     time.Duration
+}
+
+// DefaultTimeoutConfig returns the default handshake and probe budgets.
 func DefaultTimeoutConfig() TimeoutConfig {
 	return TimeoutConfig{Handshake: 3 * time.Second, Probe: 5 * time.Second}
 }
 
-// Resolve fills any non-positive field with its default. It never mutates
-// the receiver; the zero value resolves to all defaults.
+// Resolve fills non-positive timeout fields with defaults.
 func (c TimeoutConfig) Resolve() TimeoutConfig {
 	def := DefaultTimeoutConfig()
 	if c.Handshake <= 0 {
@@ -143,56 +198,16 @@ func (c TimeoutConfig) Resolve() TimeoutConfig {
 	return c
 }
 
-// PipelineConfig carries one refresh cycle's execution inputs. Refresh
-// snapshots pool state into it; executePipeline consumes the resolved copy.
-// Now is the UTC record timestamp for report fields; CycleStart is the raw
-// monotonic-bearing time.Now() used only for Elapsed.
-type PipelineConfig struct {
-	Concurrency int
-	Timeouts    TimeoutConfig
-	Now         time.Time
-	CycleStart  time.Time
-	Reporter    RefreshReporter
-}
-
-// Resolve fills every unset field with its default. It never mutates the
-// receiver; the zero value resolves to a fully usable config.
-func (c PipelineConfig) Resolve() PipelineConfig {
-	if c.Concurrency <= 0 {
-		c.Concurrency = DefaultConcurrency
-	}
-	c.Timeouts = c.Timeouts.Resolve()
-	if c.CycleStart.IsZero() {
-		c.CycleStart = time.Now()
-	}
-	if c.Now.IsZero() {
-		c.Now = c.CycleStart
-	}
-	if c.Reporter == nil {
-		c.Reporter = &noopReporter{}
-	}
-	return c
-}
-
-// RefreshProgressReport carries raw in-cycle progress; the reporter derives
-// any display percent from Completed/Total.
-type RefreshProgressReport struct {
-	Timestamp time.Time     // UTC timestamp when the refresh cycle started
-	Completed int           // Results drained so far
-	Total     int           // Total candidates in this cycle
-	Elapsed   time.Duration // Since cycle start
-}
-
-// RefreshReporter receives structured metrics during and after a refresh cycle.
-type RefreshReporter interface {
-	ReportProxy(report ProxyReport)
-	Report(report RefreshReport)
-	ReportProgress(report RefreshProgressReport)
+// Reporter receives structured pool telemetry.
+type Reporter interface {
+	ReportProxy(ProxyReport) // One call per finished check
+	ReportStats(PoolStats)   // Every Config.StatsInterval
+	ReportEvent(PoolEvent)   // State transitions
 }
 
 // noopReporter ensures safe execution when no custom reporter is registered.
 type noopReporter struct{}
 
-func (n *noopReporter) ReportProxy(_ ProxyReport)              {}
-func (n *noopReporter) Report(_ RefreshReport)                 {}
-func (n *noopReporter) ReportProgress(_ RefreshProgressReport) {}
+func (n *noopReporter) ReportProxy(_ ProxyReport) {}
+func (n *noopReporter) ReportStats(_ PoolStats)   {}
+func (n *noopReporter) ReportEvent(_ PoolEvent)   {}

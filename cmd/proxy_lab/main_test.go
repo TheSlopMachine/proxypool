@@ -31,7 +31,7 @@ func TestCSVRowMatchesHeader(t *testing.T) {
 	// the 3 trailing header columns; joinStatuses embeds N-1 pipes, so the
 	// row matches the header only when N == 3.
 	reporter := NewLabReporter(nil, stubSource{200}, stubSource{304}, stubSource{500})
-	reporter.Report(proxypool.RefreshReport{})
+	reporter.ReportStats(proxypool.PoolStats{})
 	_ = w.Close()
 	os.Stdout = old
 	out, _ := io.ReadAll(r)

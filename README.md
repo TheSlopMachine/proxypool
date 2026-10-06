@@ -11,7 +11,7 @@ A high-performance, modular Go proxy pool library designed for public and privat
 * **Continuous Time-Normalized Scoring ($\Delta t$):** Immunity against rapid refresh spam and long pauses; reputation scales strictly with elapsed observation time.
 * **Grace Buffering for Veteran Proxies:** A reputation credit system shields reliable servers from being exiled over transient network drops or short outages.
 * **Truncated Exponential Backoff with Jitter:** De-synchronizes dead "zombie" revival spikes and pushes offline servers into sleep intervals of up to 48 hours.
-* **Pluggable Architecture:** Fully decoupled `ProxySource`, `CacheSource`, and `RefreshReporter` contracts.
+* **Pluggable Architecture:** Fully decoupled `ProxySource`, `CacheSource`, and structured `Reporter` contracts with four scheduler lanes.
 
 ---
 
@@ -123,6 +123,7 @@ type CacheSource interface {
 	Get(url string) (ProxyState, bool)
 	Set(state ProxyState)
 	All() []ProxyState
+	Delete(url string)
 	Clear()
 }
 ```
@@ -132,29 +133,35 @@ type CacheSource interface {
 
 ---
 
-### 3. `RefreshReporter` Contract
+### 3. `Reporter` Contract
 
-Instead of binding to a rigid logging framework, the pool exposes structured telemetry hooks:
+The pool exposes structured telemetry hooks for completed checks, periodic pool statistics, and state transitions:
 
 ```go
-type RefreshReporter interface {
+type Reporter interface {
 	ReportProxy(report ProxyReport)
-	Report(report RefreshReport)
-	ReportProgress(report RefreshProgressReport)
+	ReportStats(stats PoolStats)
+	ReportEvent(event PoolEvent)
 }
 ```
 
-* `ReportProxy`: Emits per-proxy evaluation events (`Died`, `Revived`, current score/penalty, latency).
-* `Report`: Emits aggregated cycle statistics (min/max/median latency, average health score, cycle duration, alive counts).
-* `ReportProgress`: Emits in-cycle progress (`Completed`/`Total` raw counts plus `Elapsed` since cycle start, every 5000 completions and on completion). Derive display percent from `Completed`/`Total`; the pool never precomputes it.
+`ReportProxy` receives one event per completed proxy check. `ReportStats` receives aggregate state snapshots on `Config.StatsInterval`. `ReportEvent` receives mode, network, limiter, ingest, and breaker transitions.
 
-### 4. `TimeoutConfig` Contract
+### 4. `Scheduler` and Modes
 
-Network budgets live in one struct — the single source of truth (defaults: 3s handshake, 5s probe, 1000 workers):
+`Start(ctx)` launches four independent lanes: `foreground` and `background` consume the candidate queue, `liveness` handles due alive or suspect proxies, and `revival` handles forced checks and due banned proxies. A single adaptive limiter caps total concurrency across all lanes.
+
+The pool starts in `foreground`. It switches to `background` when the alive count reaches `HighWater`, and returns to `foreground` below `LowWater`. When foreground is starved of candidates, revival can use the majority of the concurrency budget to recover banned proxies.
+
+`RecheckBanned(BanFilter)` queues explicit revival checks without extending or shortening `ReviveAt` on failed forced checks.
+
+### 5. `TimeoutConfig` Contract
+
+Network budgets live in one struct — the single source of truth (defaults: 3s handshake, 5s probe). Concurrency is controlled by the adaptive limiter:
 
 ```go
 pool.SetTimeout(proxypool.TimeoutConfig{Handshake: 3 * time.Second, Probe: 5 * time.Second})
-pool.SetConcurrency(1000)
+pool.SetLimits(10, 50, 500)
 ```
 
 Supported schemes are centralized too: feeds filter with `proxypool.IsSupportedScheme` (`SupportedSchemes()` lists the canonical set; `socks4a` canonicalizes to `socks4`).

@@ -2,6 +2,7 @@ package proxypool
 
 import (
 	"testing"
+	"time"
 )
 
 func TestMemoryCacheClear(t *testing.T) {
@@ -45,3 +46,49 @@ func TestGetMetadataDetached(t *testing.T) {
 		t.Fatalf("unknown URL must yield empty map, got %v", got)
 	}
 }
+
+type countingCache struct {
+	*memoryCache
+	sets    int
+	deletes int
+}
+
+func newCountingCache() *countingCache        { return &countingCache{memoryCache: newMemoryCache()} }
+func (c *countingCache) Set(state ProxyState) { c.sets++; c.memoryCache.Set(state) }
+func (c *countingCache) Delete(url string)    { c.deletes++; c.memoryCache.Delete(url) }
+
+func TestIngestNewURLStaysOutOfCacheUntilCheck(t *testing.T) {
+	p := NewPool()
+	p.RegisterProxySource(stubPoolSource{urls: []string{"http://127.0.0.1:1"}, name: "feed"})
+	p.ingestOnce(time.Now().UTC())
+	if _, ok := p.cache.Get("http://127.0.0.1:1"); ok {
+		t.Fatal("new candidate must not be stored before first check")
+	}
+	p.sched.mu.Lock()
+	defer p.sched.mu.Unlock()
+	if len(p.sched.candQ) != 1 || p.sched.candQ[0].Source != "feed" {
+		t.Fatalf("candidate queue mismatch: %+v", p.sched.candQ)
+	}
+}
+
+func TestIngestKnownUpdatesSourceTimestampWithoutFrequentWrite(t *testing.T) {
+	cache := newCountingCache()
+	p := NewPool()
+	p.RegisterCacheSource(cache)
+	old := time.Now().UTC().Add(-10 * time.Minute)
+	cache.Set(ProxyState{URL: "http://127.0.0.1:2", Source: "feed", LastCheckedAt: old, LastSeenInSource: old})
+	baseline := cache.sets
+	p.RegisterProxySource(stubPoolSource{urls: []string{"http://127.0.0.1:2"}, name: "feed"})
+	p.ingestOnce(time.Now().UTC())
+	if cache.sets != baseline {
+		t.Fatalf("known proxy seen within one hour should stay in memory, sets=%d baseline=%d", cache.sets, baseline)
+	}
+}
+
+type stubPoolSource struct {
+	urls []string
+	name string
+}
+
+func (s stubPoolSource) Name() string        { return s.name }
+func (s stubPoolSource) FetchList() []string { return append([]string(nil), s.urls...) }

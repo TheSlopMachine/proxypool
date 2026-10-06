@@ -238,7 +238,7 @@ func (p parsedProxy) dialSOCKS5(ctx context.Context, target string, timeout time
 		return fail(fmt.Errorf("socks5 bad reply version 0x%02x", hdr[0]))
 	}
 	if hdr[1] != 0x00 {
-		return fail(fmt.Errorf("socks5 connect rejected (0x%02x)", hdr[1]))
+		return fail(fmt.Errorf("%w (code 0x%02x)", errProxyRejected, hdr[1]))
 	}
 	var addrLen int
 	switch hdr[3] {
@@ -308,7 +308,7 @@ func (p parsedProxy) dialSOCKS4(ctx context.Context, target string, timeout time
 	}
 	if reply[0] != 0x00 || reply[1] != 0x5A {
 		conn.Close()
-		return nil, fmt.Errorf("socks4 request rejected (code 0x%02x)", reply[1])
+		return nil, fmt.Errorf("%w (code 0x%02x)", errProxyRejected, reply[1])
 	}
 	_ = conn.SetDeadline(time.Time{})
 	return conn, nil

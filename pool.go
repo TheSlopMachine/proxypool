@@ -1,34 +1,73 @@
 package proxypool
 
 import (
-	"math"
-	"sort"
+	"context"
+	"errors"
 	"strconv"
-	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
-// ProxyPool coordinates proxy discovery, lifecycle health, and consumer queries.
+// ProxyPool coordinates proxy discovery, lifecycle health, scheduling, and consumer queries.
 type ProxyPool struct {
-	mu          sync.RWMutex
-	cache       CacheSource
-	sources     []ProxySource
-	reporter    RefreshReporter
-	timeouts    TimeoutConfig
-	concurrency int
+	mu       sync.RWMutex
+	cache    CacheSource
+	sources  []ProxySource
+	reporter Reporter
+	timeouts TimeoutConfig
+	config   Config
+
+	limiter   *limiter
+	index     *aliveIndex
+	sched     *scheduler
+	netHealth *netHealth
+	mode      atomic.Int32
+	starved   atomic.Bool
 }
 
-// NewPool initializes a pool with stock-Windows-safe defaults
-// (DefaultConcurrency workers, DefaultTimeoutConfig budgets) and default
-// in-memory storage with no-op reporting. See transport.go for why every
-// network phase must be deadline-bounded.
+type scheduler struct {
+	mu sync.Mutex
+
+	candQ    []queuedCandidate
+	candHead int
+	queued   map[string]struct{}
+	inflight map[string]struct{}
+
+	liveHeap     scheduleHeap
+	reviveHeap   scheduleHeap
+	forcedQ      []string
+	forced       map[string]struct{}
+	laneInflight map[string]int
+	lastIngestAt time.Time
+
+	wake      chan struct{}
+	ingestReq chan struct{}
+
+	ctx    context.Context
+	cancel context.CancelFunc
+	wg     sync.WaitGroup
+	start  bool
+}
+
+// NewPool initializes a pool with the configured scheduler defaults and
+// default in-memory storage with no-op reporting.
 func NewPool() *ProxyPool {
+	cfg := DefaultConfig()
 	pool := &ProxyPool{
-		sources:     make([]ProxySource, 0),
-		timeouts:    DefaultTimeoutConfig(),
-		concurrency: DefaultConcurrency,
-		reporter:    &noopReporter{},
+		sources:   make([]ProxySource, 0),
+		timeouts:  DefaultTimeoutConfig(),
+		config:    cfg,
+		reporter:  &noopReporter{},
+		limiter:   newLimiter(cfg.InitialLimit),
+		index:     newAliveIndex(),
+		netHealth: newNetHealth(),
+		sched: &scheduler{
+			queued:    make(map[string]struct{}),
+			inflight:  make(map[string]struct{}),
+			wake:      make(chan struct{}, 1),
+			ingestReq: make(chan struct{}, 1),
+		},
 	}
 	pool.RegisterCacheSource(newMemoryCache())
 	return pool
@@ -45,12 +84,15 @@ func (p *ProxyPool) RegisterCacheSource(newCache CacheSource) {
 	defer p.mu.Unlock()
 
 	if p.cache != nil {
-		existing := p.cache.All()
-		for _, state := range existing {
+		for _, state := range p.cache.All() {
 			newCache.Set(state)
 		}
 	}
-	p.cache = newCache
+	p.index.replace(newCache.All())
+	p.cache = &indexedCacheSource{inner: newCache, index: p.index}
+	if p.sched != nil {
+		p.sched.rebuildHeaps(newCache.All(), p.config.Resolve(), time.Now().UTC())
+	}
 }
 
 // RegisterProxySource adds an upstream proxy feed provider.
@@ -58,14 +100,13 @@ func (p *ProxyPool) RegisterProxySource(source ProxySource) {
 	if source == nil {
 		return
 	}
-
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	p.sources = append(p.sources, source)
+	p.mu.Unlock()
 }
 
-// RegisterReporter registers a telemetry metrics handler.
-func (p *ProxyPool) RegisterReporter(reporter RefreshReporter) {
+// RegisterReporter registers a structured telemetry handler.
+func (p *ProxyPool) RegisterReporter(reporter Reporter) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if reporter == nil {
@@ -75,263 +116,828 @@ func (p *ProxyPool) RegisterReporter(reporter RefreshReporter) {
 	p.reporter = reporter
 }
 
-// SetConcurrency configures the maximum concurrent verification workers.
-func (p *ProxyPool) SetConcurrency(n int) {
+// SetConfig updates scheduler configuration. Zero values resolve to defaults.
+func (p *ProxyPool) SetConfig(c Config) {
+	c = c.Resolve()
 	p.mu.Lock()
-	defer p.mu.Unlock()
-	if n > 0 {
-		p.concurrency = n
+	p.config = c
+	if p.limiter == nil {
+		p.limiter = newLimiter(c.InitialLimit)
+	} else {
+		p.limiter.SetLimit(clampInt(p.limiter.Limit(), c.MinLimit, c.MaxLimit))
+	}
+	p.mu.Unlock()
+	p.signalWake()
+}
+
+// SetLimits sets the dynamic concurrency range and current initial limit.
+func (p *ProxyPool) SetLimits(min, initial, max int) {
+	p.mu.Lock()
+	cfg := p.config.Resolve()
+	if min <= 0 {
+		min = cfg.MinLimit
+	}
+	if initial <= 0 {
+		initial = cfg.InitialLimit
+	}
+	if max <= 0 {
+		max = cfg.MaxLimit
+	}
+	if min < 1 {
+		min = 1
+	}
+	if initial < min {
+		initial = min
+	}
+	if max < initial {
+		max = initial
+	}
+	cfg.MinLimit, cfg.InitialLimit, cfg.MaxLimit = min, initial, max
+	p.config = cfg
+	if p.limiter == nil {
+		p.limiter = newLimiter(initial)
+	} else {
+		p.limiter.SetLimit(initial)
+	}
+	p.mu.Unlock()
+	p.signalWake()
+}
+
+// SetTimeout replaces the network budgets for handshakes and latency probes.
+func (p *ProxyPool) SetTimeout(c TimeoutConfig) {
+	p.mu.Lock()
+	p.timeouts = c.Resolve()
+	p.mu.Unlock()
+}
+
+// RequestIngest schedules an asynchronous source ingest when the pool is running.
+func (p *ProxyPool) RequestIngest() {
+	select {
+	case p.sched.ingestReq <- struct{}{}:
+	default:
 	}
 }
 
-// SetTimeout replaces the network budgets for handshakes and latency
-// probes. A zero value resolves to all defaults via TimeoutConfig.Resolve;
-// to change one phase, pass the other through unchanged.
-func (p *ProxyPool) SetTimeout(c TimeoutConfig) {
+// Start initializes persisted scheduler state and starts background ingest and dispatch.
+// The method is non-blocking and is idempotent.
+func (p *ProxyPool) Start(ctx context.Context) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
 	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.timeouts = c.Resolve()
+	p.sched.mu.Lock()
+	if p.sched.start {
+		p.sched.mu.Unlock()
+		p.mu.Unlock()
+		return
+	}
+	p.sched.start = true
+	p.mode.Store(modeForegroundValue)
+	p.starved.Store(false)
+	p.sched.ctx, p.sched.cancel = context.WithCancel(ctx)
+	p.sched.mu.Unlock()
+	cache := p.cache
+	cfg := p.config.Resolve()
+	p.mu.Unlock()
+
+	now := time.Now().UTC()
+	dropUnchecked(cache, now)
+	states := cache.All()
+	p.index.replace(states)
+	p.sched.rebuildHeaps(states, cfg, now)
+
+	p.sched.wg.Add(8)
+	go p.ingestLoop()
+	go p.foregroundLaneLoop()
+	go p.backgroundLaneLoop()
+	go p.livenessLaneLoop()
+	go p.revivalLaneLoop()
+	go p.netProbeLoop()
+	go p.modeLoop()
+	go p.statsLoop()
+	p.RequestIngest()
+	p.signalWake()
 }
 
-// Refresh performs a verification cycle:
-// 1. Fetches raw URLs from all registered ProxySources.
-// 2. Ingests and canonicalizes URLs into the cache.
-// 3. Filters candidates (new + alive + due revivals).
-// 4. Runs concurrent verification (handshake + dual-probe).
-// 5. Updates cache states and broadcasts telemetry reports.
-func (p *ProxyPool) Refresh() {
-	startTime := time.Now()
-	now := startTime.UTC()
+// Stop cancels all background scheduler goroutines and waits for them to exit.
+func (p *ProxyPool) Stop() {
+	p.mu.RLock()
+	s := p.sched
+	p.mu.RUnlock()
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	if !s.start {
+		s.mu.Unlock()
+		return
+	}
+	cancel := s.cancel
+	s.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	s.wg.Wait()
 
+	s.mu.Lock()
+	s.start = false
+	s.mu.Unlock()
+}
+
+// Refresh performs one blocking scheduler drain without starting background goroutines.
+// It ingests all sources, then checks candidates and due cached proxies using the same
+// queues, limiter, and checkOne implementation used by Start. It returns when candQ is
+// empty and no live or banned items are due at the current time.
+func (p *ProxyPool) Refresh() {
+	// Refresh is a blocking one-shot drain for CLI and tests. It uses the same
+	// queues and checkOne implementation as Start without starting background lanes.
+	now := time.Now().UTC()
+	p.ingestOnce(now)
+	p.seedDueStates(now)
+
+	ctx := context.Background()
+	var wg sync.WaitGroup
+	for {
+		task, ok := p.nextRefreshTask(time.Now().UTC())
+		if !ok {
+			break
+		}
+		if err := p.limiter.Acquire(ctx); err != nil {
+			p.requeueTask(task, time.Now().UTC().Add(30*time.Second))
+			break
+		}
+		wg.Add(1)
+		go func(task scheduledTask) {
+			defer wg.Done()
+			defer p.limiter.Release()
+			p.runCheckHeld(ctx, task)
+		}(task)
+	}
+	wg.Wait()
+}
+
+func (p *ProxyPool) nextTask(now time.Time) (scheduledTask, bool) {
+	return p.nextRefreshTask(now)
+}
+
+func (p *ProxyPool) nextRefreshTask(now time.Time) (scheduledTask, bool) {
+	cache := p.cacheSnapshot()
+	cfg := p.configSnapshot()
+	p.sched.mu.Lock()
+	defer p.sched.mu.Unlock()
+	for len(p.sched.forcedQ) > 0 {
+		url := p.sched.forcedQ[0]
+		p.sched.forcedQ = p.sched.forcedQ[1:]
+		delete(p.sched.forced, url)
+		if _, ok := p.sched.inflight[url]; ok {
+			continue
+		}
+		state, ok := cache.Get(url)
+		if !ok || !state.IsDead {
+			continue
+		}
+		p.sched.inflight[url] = struct{}{}
+		p.sched.laneInflight[string(laneRevival)]++
+		return scheduledTask{url: url, lane: string(laneRevival), forced: true}, true
+	}
+	for p.sched.liveHeap.Len() > 0 {
+		item := p.sched.liveHeap[0]
+		if item.DueAt.After(now) {
+			break
+		}
+		item = p.sched.liveHeap.PopDue(now)
+		state, ok := cache.Get(item.URL)
+		if !ok || state.IsDead {
+			continue
+		}
+		expected := nextLiveDue(state, cfg)
+		if !state.Suspect && !sameDue(item.DueAt, expected) {
+			continue
+		}
+		if _, ok := p.sched.inflight[item.URL]; ok {
+			continue
+		}
+		p.sched.inflight[item.URL] = struct{}{}
+		p.sched.laneInflight[string(laneLiveness)]++
+		return scheduledTask{url: item.URL, lane: string(laneLiveness)}, true
+	}
+	for p.sched.candHead < len(p.sched.candQ) {
+		item := p.sched.candQ[p.sched.candHead]
+		p.sched.candHead++
+		delete(p.sched.queued, item.URL)
+		if _, ok := p.sched.inflight[item.URL]; ok {
+			continue
+		}
+		p.sched.inflight[item.URL] = struct{}{}
+		p.sched.laneInflight[string(laneForeground)]++
+		if p.sched.candHead > 1024 && p.sched.candHead*2 >= len(p.sched.candQ) {
+			p.sched.candQ = append([]queuedCandidate(nil), p.sched.candQ[p.sched.candHead:]...)
+			p.sched.candHead = 0
+		}
+		return scheduledTask{url: item.URL, source: item.Source, lane: string(laneForeground)}, true
+	}
+	if p.sched.candHead == len(p.sched.candQ) {
+		p.sched.candQ = p.sched.candQ[:0]
+		p.sched.candHead = 0
+	}
+	for p.sched.reviveHeap.Len() > 0 {
+		item := p.sched.reviveHeap[0]
+		if item.DueAt.After(now) {
+			break
+		}
+		item = p.sched.reviveHeap.PopDue(now)
+		state, ok := cache.Get(item.URL)
+		if !ok || !state.IsDead || !sameDue(item.DueAt, state.ReviveAt) {
+			continue
+		}
+		if _, ok := p.sched.inflight[item.URL]; ok {
+			continue
+		}
+		p.sched.inflight[item.URL] = struct{}{}
+		p.sched.laneInflight[string(laneRevival)]++
+		return scheduledTask{url: item.URL, lane: string(laneRevival)}, true
+	}
+	return scheduledTask{}, false
+}
+
+type scheduledTask struct {
+	url    string
+	source string
+	lane   string
+	forced bool
+}
+
+func (p *ProxyPool) seedDueStates(now time.Time) {
+	p.mu.RLock()
+	cache := p.cache
+	cfg := p.config.Resolve()
+	p.mu.RUnlock()
+	if cache == nil {
+		return
+	}
+	for _, state := range cache.All() {
+		p.sched.mu.Lock()
+		_, inflight := p.sched.inflight[state.URL]
+		if !inflight {
+			if state.IsDead {
+				if !state.ReviveAt.IsZero() && !state.ReviveAt.After(now) {
+					p.sched.scheduleReviveLocked(state)
+				}
+			} else {
+				due := nextLiveDue(state, cfg)
+				if state.Suspect || (!due.IsZero() && !due.After(now)) {
+					p.sched.scheduleLiveLocked(state, cfg)
+				}
+			}
+		}
+		p.sched.mu.Unlock()
+	}
+}
+
+func (p *ProxyPool) unmarkInflight(url, lane string) {
+	p.sched.mu.Lock()
+	delete(p.sched.inflight, url)
+	if lane != "" && p.sched.laneInflight[lane] > 0 {
+		p.sched.laneInflight[lane]--
+	}
+	p.sched.mu.Unlock()
+	p.signalWake()
+}
+
+func (p *ProxyPool) finishUnstarted(url string, completed bool) {
+	if completed {
+		return
+	}
+	p.sched.mu.Lock()
+	delete(p.sched.inflight, url)
+	p.sched.mu.Unlock()
+	p.signalWake()
+}
+
+func (p *ProxyPool) requeueTask(task scheduledTask, due time.Time) {
+	p.sched.mu.Lock()
+	delete(p.sched.inflight, task.url)
+	if task.lane != "" {
+		if p.sched.laneInflight[task.lane] > 0 {
+			p.sched.laneInflight[task.lane]--
+		}
+	}
+	if task.forced {
+		if _, ok := p.sched.forced[task.url]; !ok {
+			p.sched.forced[task.url] = struct{}{}
+			p.sched.forcedQ = append(p.sched.forcedQ, task.url)
+		}
+	} else if task.source != "" {
+		if _, ok := p.sched.queued[task.url]; !ok {
+			p.sched.queued[task.url] = struct{}{}
+			p.sched.candQ = append(p.sched.candQ, queuedCandidate{URL: task.url, Source: task.source})
+		}
+	} else if task.lane == string(laneLiveness) {
+		heapPush(&p.sched.liveHeap, task.url, due)
+	} else if task.lane == string(laneRevival) {
+		heapPush(&p.sched.reviveHeap, task.url, due)
+	}
+	p.sched.mu.Unlock()
+	p.signalWake()
+}
+
+func (p *ProxyPool) runCheckHeld(ctx context.Context, task scheduledTask) {
+	state, ok := p.loadTaskState(task)
+	if !ok {
+		p.unmarkInflight(task.url, task.lane)
+		return
+	}
+	updated, report, ok := p.performCheck(ctx, state, task.lane, task.forced)
+	if !ok {
+		p.requeueTask(task, time.Now().UTC().Add(30*time.Second))
+		return
+	}
+
+	p.mu.RLock()
+	cache := p.cache
+	reporter := p.reporter
+	cfg := p.config.Resolve()
+	p.mu.RUnlock()
+	if current, exists := cache.Get(updated.URL); exists {
+		updated = mergeManualMark(current, updated)
+	}
+	cache.Set(updated)
+	p.finishState(updated, cfg, task.lane)
+	reporter.ReportProxy(reportForState(report, updated))
+}
+
+func (p *ProxyPool) checkOne(ctx context.Context, state ProxyState, lane string) (ProxyState, ProxyReport, error) {
+	return p.checkOneForced(ctx, state, lane, false)
+}
+
+func (p *ProxyPool) checkOneForced(ctx context.Context, state ProxyState, lane string, forced bool) (ProxyState, ProxyReport, error) {
+	if err := p.limiter.Acquire(ctx); err != nil {
+		return state, ProxyReport{}, err
+	}
+	defer p.limiter.Release()
+	updated, report, ok := p.performCheck(ctx, state, lane, forced)
+	if !ok {
+		return state, report, errors.New("proxy check failed")
+	}
+	return updated, report, nil
+}
+
+func (p *ProxyPool) performCheck(ctx context.Context, state ProxyState, lane string, forced bool) (ProxyState, ProxyReport, bool) {
+	p.mu.RLock()
+	timeouts := p.timeouts.Resolve()
+	p.mu.RUnlock()
+
+	wasDead := state.IsDead
+	now := time.Now().UTC()
+	state.FailReason = FailNone
+
+	hctx, cancel := context.WithTimeout(ctx, timeouts.Handshake)
+	handshakeErr := verifyHandshake(hctx, state.URL, timeouts.Handshake)
+	cancel()
+	if handshakeErr != nil {
+		state.FailReason = classifyError(wrapCheckError("handshake", handshakeErr))
+		if !p.applyFailureResult(&state, now, state.FailReason, p.NetHealth(), forced, lane) {
+			return state, ProxyReport{}, false
+		}
+		return state, ProxyReport{
+			Timestamp:  now,
+			URL:        state.URL,
+			Source:     state.Source,
+			Location:   state.Location,
+			FailReason: state.FailReason,
+			Lane:       lane,
+			IsDead:     state.IsDead,
+			Score:      state.Score,
+			Penalty:    state.Penalty,
+			ReviveAt:   state.ReviveAt,
+			Latency:    0,
+			Died:       !wasDead,
+			Revived:    false,
+		}, true
+	}
+
+	needLocation := state.Location == ""
+	pctx, cancel := context.WithTimeout(ctx, timeouts.Probe)
+	latency, location, probeErr := probeEndpoint(pctx, state.URL, needLocation, timeouts.Probe)
+	cancel()
+	if probeErr != nil {
+		state.FailReason = classifyError(wrapCheckError("probe", probeErr))
+		if !p.applyFailureResult(&state, now, state.FailReason, p.NetHealth(), forced, lane) {
+			return state, ProxyReport{}, false
+		}
+		return state, ProxyReport{
+			Timestamp:  now,
+			URL:        state.URL,
+			Source:     state.Source,
+			Location:   state.Location,
+			FailReason: state.FailReason,
+			Lane:       lane,
+			IsDead:     state.IsDead,
+			Score:      state.Score,
+			Penalty:    state.Penalty,
+			ReviveAt:   state.ReviveAt,
+			Latency:    0,
+			Died:       !wasDead,
+			Revived:    wasDead,
+		}, true
+	}
+
+	applySuccess(&state, now, latency, location)
+	return state, ProxyReport{
+		Timestamp:  now,
+		URL:        state.URL,
+		Source:     state.Source,
+		Location:   state.Location,
+		FailReason: state.FailReason,
+		Lane:       lane,
+		IsDead:     state.IsDead,
+		Score:      state.Score,
+		Penalty:    state.Penalty,
+		ReviveAt:   state.ReviveAt,
+		Latency:    state.Latency,
+		Died:       false,
+		Revived:    wasDead,
+	}, true
+}
+
+func (p *ProxyPool) applyFailureResult(state *ProxyState, now time.Time, reason FailReason, net NetSnapshot, forced bool, lane string) bool {
+	if forced {
+		applyFailureV2Config(state, now, reason, net, true, p.configSnapshot())
+		return true
+	}
+	if lane == string(laneLiveness) && !state.IsDead && !state.Suspect && !state.LastCheckedAt.IsZero() {
+		state.FailReason = reason
+		state.LastCheckedAt = now
+		state.IsDead = false
+		state.Suspect = true
+		state.ReviveAt = now.Add(10 * time.Second)
+		return true
+	}
+	applyFailureV2Config(state, now, reason, net, false, p.configSnapshot())
+	return true
+}
+
+func (p *ProxyPool) configSnapshot() Config {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.config.Resolve()
+}
+
+func reportForState(report ProxyReport, state ProxyState) ProxyReport {
+	report.Source = state.Source
+	report.Location = state.Location
+	report.FailReason = state.FailReason
+	report.IsDead = state.IsDead
+	report.Score = state.Score
+	report.Penalty = state.Penalty
+	report.ReviveAt = state.ReviveAt
+	report.Latency = state.Latency
+	return report
+}
+
+func (p *ProxyPool) loadTaskState(task scheduledTask) (ProxyState, bool) {
+	p.mu.RLock()
+	cache := p.cache
+	p.mu.RUnlock()
+	if state, ok := cache.Get(task.url); ok {
+		return state, true
+	}
+	if task.source == "" {
+		return ProxyState{}, false
+	}
+	ep, err := normalizeProxyURL(task.url)
+	if err != nil {
+		return ProxyState{}, false
+	}
+	return ProxyState{URL: ep.Canonical, IP: ep.Host, Port: ep.Port, Source: task.source, LastSeenInSource: time.Now().UTC()}, true
+}
+
+func (p *ProxyPool) finishState(state ProxyState, cfg Config, lane string) {
+	p.sched.mu.Lock()
+	delete(p.sched.inflight, state.URL)
+	if p.sched.laneInflight[lane] > 0 {
+		p.sched.laneInflight[lane]--
+	}
+	if state.IsDead {
+		p.sched.scheduleReviveLocked(state)
+	} else {
+		p.sched.scheduleLiveLocked(state, cfg)
+	}
+	p.sched.mu.Unlock()
+	p.index.upsert(state)
+	p.signalWake()
+}
+
+func (s *scheduler) scheduleLiveLocked(state ProxyState, cfg Config) {
+	due := nextLiveDue(state, cfg)
+	if !due.IsZero() {
+		heapPush(&s.liveHeap, state.URL, due)
+	}
+}
+
+func (s *scheduler) scheduleReviveLocked(state ProxyState) {
+	if !state.ReviveAt.IsZero() {
+		heapPush(&s.reviveHeap, state.URL, state.ReviveAt)
+	}
+}
+
+func (s *scheduler) rebuildHeaps(states []ProxyState, cfg Config, now time.Time) {
+	s.mu.Lock()
+	s.liveHeap = nil
+	s.reviveHeap = nil
+	s.candQ = nil
+	s.candHead = 0
+	s.queued = make(map[string]struct{})
+	s.forced = make(map[string]struct{})
+	s.forcedQ = nil
+	s.inflight = make(map[string]struct{})
+	s.laneInflight = make(map[string]int)
+	for _, state := range states {
+		if state.IsDead {
+			s.scheduleReviveLocked(state)
+		} else {
+			due := nextLiveDue(state, cfg)
+			if state.Suspect {
+				due = now
+			}
+			heapPush(&s.liveHeap, state.URL, due)
+		}
+	}
+	s.mu.Unlock()
+}
+
+func nextLiveDue(state ProxyState, cfg Config) time.Time {
+	if state.Suspect {
+		if !state.ReviveAt.IsZero() {
+			return state.ReviveAt
+		}
+		return state.LastCheckedAt
+	}
+	if state.LastCheckedAt.IsZero() {
+		return time.Time{}
+	}
+	return state.LastCheckedAt.Add(cfg.LivenessInterval)
+}
+
+func sameDue(a, b time.Time) bool {
+	return !a.IsZero() && !b.IsZero() && a.Equal(b)
+}
+
+func heapPush(h *scheduleHeap, url string, due time.Time) {
+	if due.IsZero() {
+		return
+	}
+	item := &scheduleItem{URL: url, DueAt: due}
+	// Push without importing heap in this file via the local helper method below.
+	heapPushItem(h, item)
+}
+
+func dropUnchecked(cache CacheSource, now time.Time) {
+	if cache == nil {
+		return
+	}
+	for _, state := range cache.All() {
+		if state.LastCheckedAt.IsZero() {
+			cache.Delete(state.URL)
+			continue
+		}
+		if state.LastSeenInSource.IsZero() {
+			state.LastSeenInSource = now
+			cache.Set(state)
+		}
+	}
+}
+
+func (p *ProxyPool) ingestOnce(now time.Time) {
 	p.mu.RLock()
 	cache := p.cache
 	sources := append([]ProxySource(nil), p.sources...)
 	reporter := p.reporter
-	concurrency := p.concurrency
-	timeouts := p.timeouts.Resolve()
-	if concurrency <= 0 {
-		concurrency = DefaultConcurrency
-	}
+	cfg := p.config.Resolve()
 	p.mu.RUnlock()
+	if cache == nil {
+		return
+	}
 
-	// 1. Ingestion: Fetch URLs from sources & normalize
-	totalNew := 0
+	newCount, knownCount, total := 0, 0, 0
 	for _, src := range sources {
-		rawURLs := src.FetchList()
-		for _, raw := range rawURLs {
-			ep, err := normalizeProxyURL(raw)
+		var items []TaggedURL
+		if tagged, ok := src.(TaggedSource); ok {
+			items = tagged.FetchTagged()
+		} else {
+			for _, raw := range src.FetchList() {
+				items = append(items, TaggedURL{URL: raw, Source: src.Name()})
+			}
+		}
+		for _, item := range items {
+			ep, err := normalizeProxyURL(item.URL)
 			if err != nil {
 				continue
 			}
-			if _, exists := cache.Get(ep.Canonical); !exists {
-				totalNew++
-				cache.Set(ProxyState{
-					URL:           ep.Canonical,
-					IP:            ep.Host,
-					Port:          ep.Port,
-					IsDead:        false,
-					Penalty:       0.0,
-					Score:         0.0,
-					LastCheckedAt: time.Time{},
-				})
+			total++
+			sourceName := item.Source
+			if sourceName == "" {
+				sourceName = src.Name()
 			}
-		}
-	}
-
-	// 2. Candidate Selection
-	allStates := cache.All()
-	var candidates []ProxyState
-	skippedCount := 0
-	revivedDueCount := 0
-
-	for _, item := range allStates {
-		if !item.IsDead {
-			candidates = append(candidates, item)
-		} else {
-			if !item.ReviveAt.IsZero() && (now.After(item.ReviveAt) || now.Equal(item.ReviveAt)) {
-				revivedDueCount++
-				candidates = append(candidates, item)
-			} else {
-				skippedCount++
+			state, exists := cache.Get(ep.Canonical)
+			if exists {
+				knownCount++
+				changed := false
+				if state.Source == "" {
+					state.Source = sourceName
+					changed = true
+				}
+				if now.Sub(state.LastSeenInSource) > time.Hour || state.LastSeenInSource.IsZero() {
+					state.LastSeenInSource = now
+					changed = true
+				}
+				if changed {
+					cache.Set(state)
+				}
+				continue
 			}
+
+			p.sched.mu.Lock()
+			_, alreadyQueued := p.sched.queued[ep.Canonical]
+			_, alreadyInflight := p.sched.inflight[ep.Canonical]
+			if !alreadyQueued && !alreadyInflight {
+				p.sched.candQ = append(p.sched.candQ, queuedCandidate{URL: ep.Canonical, Source: sourceName})
+				p.sched.queued[ep.Canonical] = struct{}{}
+				newCount++
+			}
+			p.sched.mu.Unlock()
 		}
 	}
 
-	// 3. Execution & Verification Pipeline
-	// startTime (raw time.Now) feeds Elapsed so progress reports measure the
-	// full cycle; now (UTC) stays the record timestamp.
-	outcomes := executePipeline(candidates, PipelineConfig{
-		Concurrency: concurrency,
-		Timeouts:    timeouts,
-		Now:         now,
-		CycleStart:  startTime,
-		Reporter:    reporter,
+	// GC is restricted to persisted banned proxies that stopped appearing in sources.
+	for _, state := range cache.All() {
+		if state.IsDead && !state.LastSeenInSource.IsZero() && now.Sub(state.LastSeenInSource) > cfg.SourceGCAge {
+			cache.Delete(state.URL)
+			p.index.delete(state.URL)
+		}
+	}
+
+	p.mu.Lock()
+	p.config = cfg
+	p.mu.Unlock()
+	p.sched.mu.Lock()
+	p.sched.lastIngestAt = now
+	p.sched.mu.Unlock()
+	p.refreshStarvedState()
+	reporter.ReportEvent(PoolEvent{
+		Time: now,
+		Kind: "ingest_done",
+		Fields: map[string]string{
+			"new":   strconv.Itoa(newCount),
+			"known": strconv.Itoa(knownCount),
+			"total": strconv.Itoa(total),
+		},
 	})
-
-	// 4. Persist Updates & Stream Proxy Reports
-	survivedCount := 0
-	diedCount := 0
-
-	for _, outcome := range outcomes {
-		st := outcome.State
-		// The pipeline ran on a snapshot; a manual mark landing
-		// mid-cycle must survive this write-back.
-		if current, ok := cache.Get(st.URL); ok {
-			st = mergeManualMark(current, st)
-		}
-		cache.Set(st)
-		reporter.ReportProxy(outcome.Report)
-		if !st.IsDead {
-			survivedCount++
-		}
-		if outcome.Report.Died {
-			diedCount++
-		}
-	}
-
-	// 5. Compute Cycle Telemetry Metrics across the Active Pool in one pass.
-	currentAlive := cache.All()
-	var activeLatencies []time.Duration
-
-	aliveCount := 0
-	var scoreSum, penaltySum, maxScore, maxPenalty float64
-	for _, item := range currentAlive {
-		if item.IsDead {
-			continue
-		}
-		aliveCount++
-		activeLatencies = append(activeLatencies, item.Latency)
-		scoreSum += item.Score
-		penaltySum += item.Penalty
-		if item.Score > maxScore {
-			maxScore = item.Score
-		}
-		if item.Penalty > maxPenalty {
-			maxPenalty = item.Penalty
-		}
-	}
-
-	var minLat, maxLat, medLat time.Duration
-	if len(activeLatencies) > 0 {
-		sort.Slice(activeLatencies, func(i, j int) bool { return activeLatencies[i] < activeLatencies[j] })
-		minLat = activeLatencies[0]
-		maxLat = activeLatencies[len(activeLatencies)-1]
-		medLat = medianDuration(activeLatencies)
-	}
-
-	meanScore, meanPenalty := 0.0, 0.0
-	if aliveCount > 0 {
-		meanScore = scoreSum / float64(aliveCount)
-		meanPenalty = penaltySum / float64(aliveCount)
-	}
-
-	// 6. Broadcast Aggregated Cycle Report
-	reporter.Report(RefreshReport{
-		Timestamp:            startTime,
-		Duration:             time.Since(startTime),
-		ProxiesTotal:         len(currentAlive),
-		ProxiesTotalNew:      totalNew,
-		ProxiesTotalSkipped:  skippedCount,
-		ProxiesTotalRevived:  revivedDueCount,
-		ProxiesTotalProbed:   len(candidates),
-		ProxiesTotalSurvived: survivedCount,
-		ProxiesTotalDied:     diedCount,
-		ProxiesTotalAlive:    aliveCount,
-		LatencyMinimum:       minLat,
-		LatencyMaximum:       maxLat,
-		LatencyMedian:        medLat,
-		ScoreMaximum:         maxScore,
-		ScoreAverage:         meanScore,
-		PenaltyMaximum:       maxPenalty,
-		PenaltyAverage:       meanPenalty,
-	})
+	p.signalWake()
 }
 
-// ListProxies returns active proxies matching the provided filter criteria,
-// sorted by lowest latency first.
-func (p *ProxyPool) ListProxies(filter ProxyFilter) []ProxyInfo {
+func (p *ProxyPool) ingestLoop() {
+	defer p.sched.wg.Done()
+	for {
+		p.mu.RLock()
+		interval := p.config.Resolve().IngestInterval
+		ctx := p.sched.ctx
+		p.mu.RUnlock()
+		timer := time.NewTimer(interval)
+		select {
+		case <-timer.C:
+			p.ingestOnce(time.Now().UTC())
+		case <-p.sched.ingestReq:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			p.ingestOnce(time.Now().UTC())
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return
+		}
+	}
+}
+
+func (p *ProxyPool) signalWake() {
+	if p.sched == nil || p.sched.wake == nil {
+		return
+	}
+	select {
+	case p.sched.wake <- struct{}{}:
+	default:
+	}
+}
+
+func clampInt(v, min, max int) int {
+	if v < min {
+		return min
+	}
+	if v > max {
+		return max
+	}
+	return v
+}
+
+// Suspect marks a known alive proxy for an immediate liveness recheck without
+// changing its reputation. The proxy remains out of ListProxies until a check succeeds.
+func (p *ProxyPool) Suspect(url string, reason FailReason) bool {
+	if url == "" {
+		return false
+	}
 	p.mu.RLock()
 	cache := p.cache
 	p.mu.RUnlock()
-
-	all := cache.All()
-	matches := make([]ProxyInfo, 0, len(all))
-
-	for _, item := range all {
-		if item.IsDead {
-			continue
-		}
-
-		if filter.Location != nil && !strings.EqualFold(item.Location, *filter.Location) {
-			continue
-		}
-
-		if filter.MaxLatency != nil && item.Latency > *filter.MaxLatency {
-			continue
-		}
-
-		if filter.MinScore != nil && item.Score < *filter.MinScore {
-			continue
-		}
-
-		matches = append(matches, ProxyInfo{
-			URL:         item.URL,
-			IP:          item.IP,
-			Port:        item.Port,
-			Location:    item.Location,
-			Latency:     item.Latency,
-			Score:       math.Round(item.Score*100) / 100,
-			LastChecked: item.LastCheckedAt,
-		})
+	if cache == nil {
+		return false
 	}
-
-	// Sort ascending by response latency
-	sort.Slice(matches, func(i, j int) bool {
-		return matches[i].Latency < matches[j].Latency
-	})
-
-	// Apply Limit (KISS)
-	if filter.Limit != nil && *filter.Limit > 0 && len(matches) > *filter.Limit {
-		matches = matches[:*filter.Limit]
+	state, ok := cache.Get(url)
+	if !ok || state.IsDead || state.Suspect {
+		return false
 	}
-
-	return matches
+	now := time.Now().UTC()
+	state.Suspect = true
+	state.IsDead = false
+	state.FailReason = reason
+	state.ReviveAt = now
+	state.LastCheckedAt = now
+	cache.Set(state)
+	p.index.upsert(state)
+	p.sched.mu.Lock()
+	delete(p.sched.inflight, url)
+	heapPush(&p.sched.liveHeap, url, now)
+	p.sched.mu.Unlock()
+	p.signalWake()
+	return true
 }
 
-// Manual exclusion schedule for MarkDead. Bans escalate per repeat mark
-// and stay below the feed refresh cycle; forgiveness outlives the maximum
-// flap period so re-offending proxies never qualify.
+// RecheckBanned queues banned proxies for the revival lane without changing their ban schedule.
+func (p *ProxyPool) RecheckBanned(f BanFilter) int {
+	states := p.cacheAll()
+	queued := 0
+	p.sched.mu.Lock()
+	for _, state := range states {
+		if !state.IsDead {
+			continue
+		}
+		if f.Reason != FailNone && state.FailReason != f.Reason {
+			continue
+		}
+		if f.Source != "" && state.Source != f.Source {
+			continue
+		}
+		if _, ok := p.sched.inflight[state.URL]; ok {
+			continue
+		}
+		if _, ok := p.sched.forced[state.URL]; ok {
+			continue
+		}
+		p.sched.forced[state.URL] = struct{}{}
+		p.sched.forcedQ = append(p.sched.forcedQ, state.URL)
+		queued++
+	}
+	p.sched.mu.Unlock()
+	if queued > 0 {
+		p.signalWake()
+	}
+	return queued
+}
+
+// Manual exclusion schedule for MarkDead.
 const (
 	markDeadBaseBan      = 15 * time.Minute
 	markDeadMaxBan       = 4 * time.Hour
 	markDeadForgiveAfter = 24 * time.Hour
 )
 
-// Metadata keys carrying manual exclusion memory. Score and Penalty stay
-// probe-only; these keys live on a separate channel the probe never heals.
 const (
 	markCountKey  = "manual_dead_count"
 	markLastAtKey = "manual_dead_last_at"
 	markReasonKey = "manual_dead_reason"
 )
 
-// MarkDead excludes the proxy with the given canonical URL until an
-// escalating ban expires. It records an upstream-observed fault the probe
-// cannot see, so it never touches Score or Penalty. Unknown or empty URLs
-// return false. Repeat marks extend the ban; a full idle day forgives.
+// MarkDead excludes the proxy with the given canonical URL until an escalating ban expires.
 func (p *ProxyPool) MarkDead(url, reason string) bool {
 	if url == "" {
 		return false
 	}
-
 	p.mu.Lock()
-	defer p.mu.Unlock()
-
 	if p.cache == nil {
+		p.mu.Unlock()
 		return false
 	}
 	state, ok := p.cache.Get(url)
 	if !ok {
+		p.mu.Unlock()
 		return false
 	}
 	now := time.Now().UTC()
@@ -357,35 +963,40 @@ func (p *ProxyPool) MarkDead(url, reason string) bool {
 		state.Metadata[markReasonKey] = reason
 	}
 	state.IsDead = true
+	state.Suspect = false
 	if revive := now.Add(ban); revive.After(state.ReviveAt) {
 		state.ReviveAt = revive
 	}
 	state.LastCheckedAt = now
-	p.cache.Set(state)
-	if p.reporter != nil {
-		p.reporter.ReportProxy(ProxyReport{
-			Timestamp: now,
-			URL:       state.URL,
-			Location:  state.Location,
-			IsDead:    state.IsDead,
-			Score:     state.Score,
-			Penalty:   state.Penalty,
-			ReviveAt:  state.ReviveAt,
-			Latency:   state.Latency,
-		})
-	}
+	cache := p.cache
+	reporter := p.reporter
+	cfg := p.config.Resolve()
+	p.mu.Unlock()
+
+	cache.Set(state)
+	p.finishState(state, cfg, "manual")
+	reporter.ReportProxy(ProxyReport{
+		Timestamp:  now,
+		URL:        state.URL,
+		Source:     state.Source,
+		Location:   state.Location,
+		FailReason: state.FailReason,
+		Lane:       "manual",
+		IsDead:     state.IsDead,
+		Score:      state.Score,
+		Penalty:    state.Penalty,
+		ReviveAt:   state.ReviveAt,
+		Latency:    state.Latency,
+	})
 	return true
 }
 
-// mergeManualMark preserves a newer manual exclusion over pipeline output.
-// Refresh snapshots candidates before probing; a mark landing mid-cycle
-// must survive the stale write-back. Equal counts mean no intervening
-// mark, so the pipeline verdict stands.
 func mergeManualMark(current, updated ProxyState) ProxyState {
 	if markCount(current.Metadata) <= markCount(updated.Metadata) {
 		return updated
 	}
 	updated.IsDead = true
+	updated.Suspect = false
 	if current.ReviveAt.After(updated.ReviveAt) {
 		updated.ReviveAt = current.ReviveAt
 	}
@@ -419,17 +1030,13 @@ func markLastAt(metadata map[string]string) time.Time {
 	return t
 }
 
-// UpdateMetadata runs update against the custom metadata map for the given
-// proxy URL (exact match, no normalization). Initializes the map if nil.
-// No-op if the proxy is unknown or update is nil.
+// UpdateMetadata runs update against the custom metadata map for the given proxy URL.
 func (p *ProxyPool) UpdateMetadata(url string, update func(map[string]string)) {
 	if update == nil {
 		return
 	}
-
 	p.mu.Lock()
 	defer p.mu.Unlock()
-
 	state, ok := p.cache.Get(url)
 	if !ok {
 		return
@@ -441,13 +1048,10 @@ func (p *ProxyPool) UpdateMetadata(url string, update func(map[string]string)) {
 	p.cache.Set(state)
 }
 
-// GetMetadata returns a copy of the custom metadata for the given proxy URL
-// (exact match, no normalization). Returns a new empty map if the proxy is
-// unknown or has no metadata. The returned map is detached from the pool.
+// GetMetadata returns a detached copy of custom metadata for the given proxy URL.
 func (p *ProxyPool) GetMetadata(url string) map[string]string {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-
 	state, ok := p.cache.Get(url)
 	if !ok || state.Metadata == nil {
 		return make(map[string]string)
@@ -457,4 +1061,9 @@ func (p *ProxyPool) GetMetadata(url string) map[string]string {
 		out[k] = v
 	}
 	return out
+}
+
+// ListProxies reads only the in-memory alive index.
+func (p *ProxyPool) ListProxies(filter ProxyFilter) []ProxyInfo {
+	return p.index.list(filter)
 }

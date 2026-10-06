@@ -40,6 +40,12 @@ func (m *memoryCache) All() []ProxyState {
 	return list
 }
 
+func (m *memoryCache) Delete(url string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.data, url)
+}
+
 func (m *memoryCache) Clear() {
 	m.mu.Lock()
 	defer m.mu.Unlock()

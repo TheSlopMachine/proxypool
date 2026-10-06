@@ -363,20 +363,6 @@ func (r *LabReporter) ReportProxy(p proxypool.ProxyReport) {
 	}
 }
 
-// ReportProgress streams in-cycle probe progress to stderr. Percent is
-// derived here from the raw counts; the pool only sends Completed/Total.
-func (r *LabReporter) ReportProgress(p proxypool.RefreshProgressReport) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	pct := 0.0
-	if p.Total > 0 {
-		pct = 100 * float64(p.Completed) / float64(p.Total)
-	}
-	fmt.Fprintf(os.Stderr, "probe progress: %d/%d (%.0f%%) in %v\n",
-		p.Completed, p.Total, pct, p.Elapsed.Round(time.Second))
-}
-
 // formatNames sorts the per-cycle names and caps the cell at maxNamesPerCell
 // entries with a single +N-more overflow token.
 func formatNames(names []string) string {
@@ -394,44 +380,37 @@ func formatNames(names []string) string {
 	return strings.Join(names, " ")
 }
 
-func (r *LabReporter) Report(report proxypool.RefreshReport) {
+func (r *LabReporter) ReportStats(report proxypool.PoolStats) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-
 	statuses := make([]int, 0, len(r.sources))
-	for _, s := range r.sources {
-		statuses = append(statuses, s.LastStatus())
+	for _, source := range r.sources {
+		statuses = append(statuses, source.LastStatus())
 	}
-
-	// Format row strictly matching csvHeader.
-	row := fmt.Sprintf("%s|%d|%d|%d|%d|%d|%d|%d|%d|%d|%dms|%dms|%s|%s|%.2f|%.2f|%.2f|%.2f|%.2fs|%s\n",
-		report.Timestamp.Format("2006-01-02 15:04:05"),
+	total := report.Alive + report.Suspect + report.Banned + report.Queued + report.Inflight
+	row := fmt.Sprintf("%s|%d|%d|%d|%d|%d|%d|%d|%d|%d|%dms|%dms|%s|%s|%.2f|%.2f|%.2f|%.2f|%s|%s\n",
+		report.Time.Format("2006-01-02 15:04:05"),
 		collapseStatus(statuses...),
-		report.ProxiesTotal,
-		report.ProxiesTotalNew,
-		report.ProxiesTotalSkipped,
-		report.ProxiesTotalRevived,
-		report.ProxiesTotalProbed,
-		report.ProxiesTotalSurvived,
-		report.ProxiesTotalDied,
-		report.ProxiesTotalAlive,
-		report.LatencyMinimum.Milliseconds(),
-		report.LatencyMedian.Milliseconds(),
+		total,
+		report.Queued,
+		0,
+		0,
+		report.Inflight,
+		report.Alive,
+		report.Suspect,
+		report.Alive,
+		0,
+		0,
 		formatNames(r.diedNames),
 		formatNames(r.revivedNames),
-		report.ScoreMaximum,
-		report.ScoreAverage,
-		report.PenaltyMaximum,
-		report.PenaltyAverage,
-		report.Duration.Seconds(),
+		0.0,
+		0.0,
+		0.0,
+		0.0,
+		"-",
 		joinStatuses(statuses),
 	)
-
-	// Stream to stdout
 	fmt.Print(row)
-
-	// Write to table file and flush immediately. Failures are loud:
-	// silent CSV loss was the original production symptom.
 	if r.tableFile != nil {
 		if _, err := r.tableFile.WriteString(row); err != nil {
 			r.writeErrs++
@@ -441,11 +420,11 @@ func (r *LabReporter) Report(report proxypool.RefreshReport) {
 			fmt.Fprintf(os.Stderr, "table sync failed (%d total): %v\n", r.writeErrs, err)
 		}
 	}
-
-	// Reset per-cycle collections
 	r.diedNames = nil
 	r.revivedNames = nil
 }
+
+func (r *LabReporter) ReportEvent(_ proxypool.PoolEvent) {}
 
 func joinStatuses(statuses []int) string {
 	parts := make([]string, 0, len(statuses))
@@ -516,7 +495,7 @@ func main() {
 
 	// 3. Setup proxy pool, embedded upstream sources, and reporter
 	pool := proxypool.NewPool()
-	pool.SetConcurrency(*concurrencyFlag)
+	pool.SetLimits(*concurrencyFlag, *concurrencyFlag, *concurrencyFlag)
 	pool.SetTimeout(proxypool.TimeoutConfig{Handshake: *handshakeFlag, Probe: *timeoutFlag})
 	// Feed client: whole-request 30s cap plus 10s TLS/header caps so a
 	// stalled CDN edge fails fast instead of blocking ingestion.
@@ -549,6 +528,7 @@ func main() {
 	// Run initial check immediately
 	sampleCount++
 	pool.Refresh()
+	reporter.ReportStats(pool.Snapshot())
 
 	for {
 		if *samplesFlag > 0 && sampleCount >= *samplesFlag {
@@ -563,6 +543,7 @@ func main() {
 		case <-ticker.C:
 			sampleCount++
 			pool.Refresh()
+			reporter.ReportStats(pool.Snapshot())
 		}
 	}
 }
