@@ -152,7 +152,7 @@ func TestRequireMergesWaitersIntoOneDemand(t *testing.T) {
 	wg.Wait()
 }
 
-func TestDemandExpiresAfterTTLOnly_WithoutWaiters(t *testing.T) {
+func TestDemandExpiresAfterReplenishTTLOnly_WithoutWaiters(t *testing.T) {
 	r := newDemandRegistry()
 	cfg := DefaultConfig()
 	now := time.Now().UTC()
@@ -160,13 +160,13 @@ func TestDemandExpiresAfterTTLOnly_WithoutWaiters(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	later := now.Add(cfg.DemandTTL + time.Minute)
+	later := now.Add(cfg.ReplenishTTL + time.Minute)
 	if got := r.snapshot(later); len(got) != 1 {
 		t.Fatalf("demand with a waiter must not expire: %+v", got)
 	}
 	r.release(d)
 	if got := r.snapshot(later); len(got) != 0 {
-		t.Fatalf("demand without waiters must expire after TTL: %+v", got)
+		t.Fatalf("demand without waiters must expire after ReplenishTTL: %+v", got)
 	}
 }
 

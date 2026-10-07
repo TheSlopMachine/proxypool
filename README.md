@@ -179,6 +179,16 @@ Supported schemes are centralized too: feeds filter with `proxypool.IsSupportedS
 - Waiters with the same country set share one demand. Cancelling `ctx` releases only the waiter; the demand stays registered for `Config.DemandTTL` (default 5m). `Config.MaxDemands` caps distinct demands (`ErrDemandLimit`).
 - Registered demands appear in `PoolStats.Demands`; `demand_created`, `demand_satisfied`, `demand_expired` and `require_timeout` are reported as `PoolEvent`s.
 
+### Demand scheduling
+
+Registered demands steer the scheduler without changing the pool modes:
+
+- A demand is **hot** while it has waiters, or while nothing matches inside `Config.DemandTTL`. A hot demand switches lane gating to the foreground profile (candidates 65%, liveness 15%, revival 20% of the limit).
+- A demand is **replenishing** while fewer than `Want` (default `Config.CountryTarget`) alive proxies match, until `Config.ReplenishTTL` after its last use. In background mode this multiplies candidate intensity by 4; at the target it returns to 1x.
+- Banned proxies whose last known `Location` matches are force-rechecked first (soft failures first, at most 20 per 2s, once per 2 minutes each). Failed forced rechecks leave `Penalty` and `ReviveAt` unchanged.
+- Candidates whose source hint (`TaggedURL.Country`) matches a demanded country are checked before the rest. The hint only orders the queue; the probe sets the real `Location`.
+- `demand_priority` events report `idle`, `hot` and `replenish` transitions; `PoolStats.Demands` carries per-demand `State`, `Alive` and `Target`.
+
 ## The Mathematics & Design
 
 Public proxy lists exhibit extreme behavior: **~98% of scraped proxies are dead servers**, newly discovered proxies have a **75%+ first-minute mortality rate**, and fewer than **1% remain viable over 8+ hours**. 

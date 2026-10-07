@@ -164,6 +164,18 @@ func (i *aliveIndex) match(countries []string, exclude map[string]struct{}, max 
 	return out
 }
 
+// countByLocation returns the number of alive proxies per upper-case location
+// and the total alive count.
+func (i *aliveIndex) countByLocation() (map[string]int, int) {
+	i.mu.RLock()
+	defer i.mu.RUnlock()
+	counts := make(map[string]int)
+	for _, info := range i.items {
+		counts[strings.ToUpper(info.Location)]++
+	}
+	return counts, len(i.items)
+}
+
 func locationIn(countries []string, location string) bool {
 	for _, c := range countries {
 		if strings.EqualFold(c, location) {

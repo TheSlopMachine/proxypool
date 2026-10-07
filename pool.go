@@ -21,6 +21,10 @@ type ProxyPool struct {
 	limiter   *limiter
 	index     *aliveIndex
 	demands   *demandRegistry
+	needMu    sync.Mutex // guards the memoized demand need
+	need      demandNeed
+	needAt    time.Time
+	needLabel string
 	sched     *scheduler
 	netHealth *netHealth
 	mode      atomic.Int32
@@ -32,6 +36,7 @@ type scheduler struct {
 
 	candQ    []queuedCandidate
 	candHead int
+	hinted   map[string][]queuedCandidate // source-hinted candidates by country, same entries as candQ
 	queued   map[string]struct{}
 	inflight map[string]struct{}
 
@@ -65,6 +70,7 @@ func NewPool() *ProxyPool {
 		netHealth: newNetHealth(),
 		sched: &scheduler{
 			queued:    make(map[string]struct{}),
+			hinted:    make(map[string][]queuedCandidate),
 			inflight:  make(map[string]struct{}),
 			wake:      make(chan struct{}, 1),
 			ingestReq: make(chan struct{}, 1),
@@ -219,7 +225,7 @@ func (p *ProxyPool) Start(ctx context.Context) {
 	p.index.replace(states)
 	p.sched.rebuildHeaps(states, cfg, now)
 
-	p.sched.wg.Add(8)
+	p.sched.wg.Add(9)
 	go p.ingestLoop()
 	go p.foregroundLaneLoop()
 	go p.backgroundLaneLoop()
@@ -228,6 +234,7 @@ func (p *ProxyPool) Start(ctx context.Context) {
 	go p.netProbeLoop()
 	go p.modeLoop()
 	go p.statsLoop()
+	go p.demandReviveLoop()
 	p.RequestIngest()
 	p.signalWake()
 }
@@ -296,6 +303,7 @@ func (p *ProxyPool) nextTask(now time.Time) (scheduledTask, bool) {
 func (p *ProxyPool) nextRefreshTask(now time.Time) (scheduledTask, bool) {
 	cache := p.cacheSnapshot()
 	cfg := p.configSnapshot()
+	need := p.demandNeed(now)
 	p.sched.mu.Lock()
 	defer p.sched.mu.Unlock()
 	for len(p.sched.forcedQ) > 0 {
@@ -334,24 +342,10 @@ func (p *ProxyPool) nextRefreshTask(now time.Time) (scheduledTask, bool) {
 		p.sched.laneInflight[string(laneLiveness)]++
 		return scheduledTask{url: item.URL, lane: string(laneLiveness)}, true
 	}
-	for p.sched.candHead < len(p.sched.candQ) {
-		item := p.sched.candQ[p.sched.candHead]
-		p.sched.candHead++
-		delete(p.sched.queued, item.URL)
-		if _, ok := p.sched.inflight[item.URL]; ok {
-			continue
-		}
+	if item, ok := p.sched.popCandidateLocked(need.Countries); ok {
 		p.sched.inflight[item.URL] = struct{}{}
 		p.sched.laneInflight[string(laneForeground)]++
-		if p.sched.candHead > 1024 && p.sched.candHead*2 >= len(p.sched.candQ) {
-			p.sched.candQ = append([]queuedCandidate(nil), p.sched.candQ[p.sched.candHead:]...)
-			p.sched.candHead = 0
-		}
 		return scheduledTask{url: item.URL, source: item.Source, lane: string(laneForeground)}, true
-	}
-	if p.sched.candHead == len(p.sched.candQ) {
-		p.sched.candQ = p.sched.candQ[:0]
-		p.sched.candHead = 0
 	}
 	for p.sched.reviveHeap.Len() > 0 {
 		item := p.sched.reviveHeap[0]
@@ -661,6 +655,7 @@ func (s *scheduler) rebuildHeaps(states []ProxyState, cfg Config, now time.Time)
 	s.candQ = nil
 	s.candHead = 0
 	s.queued = make(map[string]struct{})
+	s.hinted = make(map[string][]queuedCandidate)
 	s.forced = make(map[string]struct{})
 	s.forcedQ = nil
 	s.inflight = make(map[string]struct{})
@@ -774,7 +769,11 @@ func (p *ProxyPool) ingestOnce(now time.Time) {
 			_, alreadyQueued := p.sched.queued[ep.Canonical]
 			_, alreadyInflight := p.sched.inflight[ep.Canonical]
 			if !alreadyQueued && !alreadyInflight {
-				p.sched.candQ = append(p.sched.candQ, queuedCandidate{URL: ep.Canonical, Source: sourceName})
+				candidate := queuedCandidate{URL: ep.Canonical, Source: sourceName, Country: normalizeCountryHint(item.Country)}
+				p.sched.candQ = append(p.sched.candQ, candidate)
+				if candidate.Country != "" {
+					p.sched.hinted[candidate.Country] = append(p.sched.hinted[candidate.Country], candidate)
+				}
 				p.sched.queued[ep.Canonical] = struct{}{}
 				newCount++
 			}
@@ -795,6 +794,7 @@ func (p *ProxyPool) ingestOnce(now time.Time) {
 	p.mu.Unlock()
 	p.sched.mu.Lock()
 	p.sched.lastIngestAt = now
+	p.sched.pruneHintedLocked()
 	p.sched.mu.Unlock()
 	p.refreshStarvedState()
 	reporter.ReportEvent(PoolEvent{

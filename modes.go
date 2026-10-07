@@ -93,7 +93,7 @@ func (p *ProxyPool) refreshStarvedState() {
 	p.mu.RUnlock()
 	alive := len(p.index.list(ProxyFilter{}))
 	p.sched.mu.Lock()
-	candEmpty := len(p.sched.candQ)-p.sched.candHead == 0
+	candEmpty := len(p.sched.queued) == 0
 	candInflight := p.sched.laneInflight[string(laneForeground)] + p.sched.laneInflight[string(laneBackground)]
 	p.sched.mu.Unlock()
 	starved := p.Mode() == ModeForeground && alive < cfg.LowWater && candEmpty && candInflight == 0

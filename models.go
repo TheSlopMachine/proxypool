@@ -111,9 +111,13 @@ type NetSnapshot struct {
 type DemandStat struct {
 	Countries       []string // Sorted ISO codes; empty means any country
 	Waiters         int
-	Served          int64 // Proxies handed out through this demand
+	Served          int64  // Proxies handed out through this demand
+	Target          int    // Alive proxies the pool maintains for this country set
+	Alive           int    // Alive proxies currently matching; set by Snapshot only
+	State           string // "waiting", "hunting", "replenishing" or "satisfied"; set by Snapshot only
 	CreatedAt       time.Time
-	ExpiresAt       time.Time
+	ExpiresAt       time.Time // End of the hunting window while nothing matches
+	ReplenishUntil  time.Time // End of target maintenance and of the registration
 	LastSatisfiedAt time.Time
 }
 
@@ -178,6 +182,9 @@ type ProxySource interface {
 type TaggedURL struct {
 	URL    string
 	Source string
+	// Country is an optional two-letter hint from the source. It only orders
+	// candidates; the real location is confirmed by the probe.
+	Country string
 }
 
 // TaggedSource optionally supplies per-URL source tags during ingest.

@@ -43,6 +43,31 @@ func laneCaps(mode Mode, starved bool, limit int) map[lane]int {
 	return caps
 }
 
+// laneCapsFor adjusts the mode profile for demand pressure. A hot demand
+// switches to a foreground profile with a larger revival share, because known
+// banned proxies of the demanded country are the cheapest source of a match.
+// A boost above 1 scales the background candidate share while a country target
+// is being refilled.
+func laneCapsFor(mode Mode, starved, hot bool, limit, boost int) map[lane]int {
+	caps := laneCaps(mode, starved, limit)
+	if starved && mode == ModeForeground {
+		return caps
+	}
+	if hot {
+		caps[laneForeground] = laneCap(0.65, limit, true)
+		caps[laneBackground] = 0
+		caps[laneLiveness] = laneCap(0.15, limit, true)
+		caps[laneRevival] = laneCap(0.20, limit, true)
+		return caps
+	}
+	if mode == ModeBackground && boost > 1 {
+		caps[laneBackground] = laneCap(min(0.80, 0.20*float64(boost)), limit, true)
+		caps[laneLiveness] = laneCap(0.15, limit, true)
+		caps[laneRevival] = laneCap(0.05, limit, true)
+	}
+	return caps
+}
+
 func laneCap(fraction float64, limit int, minimumOne bool) int {
 	cap := int(float64(limit) * fraction)
 	if float64(cap) < float64(limit)*fraction {
@@ -83,7 +108,8 @@ func (p *ProxyPool) laneLoop(name lane) {
 		if p.contextDone() {
 			return
 		}
-		mode := p.Mode()
+		need := p.demandNeed(time.Now().UTC())
+		mode := p.laneMode(need)
 		if (name == laneForeground && mode != ModeForeground) || (name == laneBackground && mode != ModeBackground) {
 			if !p.waitForWake(250 * time.Millisecond) {
 				return
@@ -99,7 +125,7 @@ func (p *ProxyPool) laneLoop(name lane) {
 
 		if name == laneBackground {
 			limit := p.limiter.Limit()
-			rate := max(1, limit*20/100/5)
+			rate := max(1, limit*20/100/5) * p.replenishBoost(need, mode)
 			interval := time.Second / time.Duration(rate)
 			if !nextBackgroundStart.IsZero() {
 				remaining := time.Until(nextBackgroundStart)
@@ -208,12 +234,16 @@ func (p *ProxyPool) waitNetUsableForLane() bool {
 }
 
 func (p *ProxyPool) nextLaneTask(name lane, now time.Time) (scheduledTask, bool) {
-	mode := p.Mode()
+	need := p.demandNeed(now)
+	mode := p.laneMode(need)
 	starved := p.Starved()
-	caps := laneCaps(mode, starved, p.limiter.Limit())
+	caps := laneCapsFor(mode, starved, need.Hot, p.limiter.Limit(), p.replenishBoost(need, mode))
 	cache := p.cacheSnapshot()
 	cfg := p.configSnapshot()
-	states := cache.All()
+	var states []ProxyState
+	if name == laneRevival && starved {
+		states = cache.All()
+	}
 	p.sched.mu.Lock()
 	defer p.sched.mu.Unlock()
 	if p.sched.laneInflight[string(name)] >= caps[name] && !p.canBorrowLocked(name, now, caps[name]) {
@@ -222,25 +252,12 @@ func (p *ProxyPool) nextLaneTask(name lane, now time.Time) (scheduledTask, bool)
 
 	switch name {
 	case laneForeground, laneBackground:
-		for p.sched.candHead < len(p.sched.candQ) {
-			item := p.sched.candQ[p.sched.candHead]
-			p.sched.candHead++
-			delete(p.sched.queued, item.URL)
-			if _, ok := p.sched.inflight[item.URL]; ok {
-				continue
-			}
+		if item, ok := p.sched.popCandidateLocked(need.Countries); ok {
 			p.sched.inflight[item.URL] = struct{}{}
 			p.sched.laneInflight[string(name)]++
-			if p.sched.candHead > 1024 && p.sched.candHead*2 >= len(p.sched.candQ) {
-				p.sched.candQ = append([]queuedCandidate(nil), p.sched.candQ[p.sched.candHead:]...)
-				p.sched.candHead = 0
-			}
 			return scheduledTask{url: item.URL, source: item.Source, lane: string(name)}, true
 		}
-		if p.sched.candHead == len(p.sched.candQ) {
-			p.sched.candQ = p.sched.candQ[:0]
-			p.sched.candHead = 0
-		}
+
 	case laneLiveness:
 		for p.sched.liveHeap.Len() > 0 {
 			item := p.sched.liveHeap[0]
@@ -284,7 +301,7 @@ func (p *ProxyPool) nextLaneTask(name lane, now time.Time) (scheduledTask, bool)
 			p.sched.laneInflight[string(name)]++
 			return scheduledTask{url: url, lane: string(name), forced: true}, true
 		}
-		if p.Starved() {
+		if starved {
 			return p.nextStarvedRevivalLocked(name, now, states)
 		}
 		for p.sched.reviveHeap.Len() > 0 {
@@ -333,7 +350,7 @@ func (p *ProxyPool) canBorrowLocked(name lane, now time.Time, cap int) bool {
 
 func (p *ProxyPool) laneQueuedLocked(name lane, now time.Time) int {
 	if name == laneForeground || name == laneBackground {
-		return len(p.sched.candQ) - p.sched.candHead
+		return len(p.sched.queued)
 	}
 	if name == laneLiveness {
 		count := 0

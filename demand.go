@@ -20,7 +20,8 @@ var (
 )
 
 const (
-	maxRequireLimit = 50
+	maxRequireLimit  = 50
+	maxCountryTarget = 200
 	// shuffleFactor widens the candidate window before Limit proxies are drawn,
 	// so concurrent callers do not all land on the lowest-latency proxy.
 	shuffleFactor = 4
@@ -37,6 +38,9 @@ type RequireOptions struct {
 	Limit int
 	// Timeout is the overall deadline of the call. Zero uses Config.RequireTimeout.
 	Timeout time.Duration
+	// Want is the number of alive proxies the pool should keep for Countries after
+	// this call. Zero uses Config.CountryTarget. It has no effect without Countries.
+	Want int
 }
 
 // RequireResult is the outcome of Require. Proxies is empty when TimedOut is true.
@@ -70,6 +74,7 @@ func (p *ProxyPool) Require(ctx context.Context, opts RequireOptions) (RequireRe
 	if timeout <= 0 {
 		timeout = cfg.RequireTimeout
 	}
+	want := clampInt(opts.Want, 0, maxCountryTarget)
 	key := strings.Join(countries, ",")
 	started := time.Now().UTC()
 
@@ -77,18 +82,21 @@ func (p *ProxyPool) Require(ctx context.Context, opts RequireOptions) (RequireRe
 		if len(countries) > 0 {
 			// Keep the country demand alive so the pool maintains its stock.
 			// A full registry must not fail a request that is already served.
-			if d, err := p.demands.acquire(key, countries, started, cfg, false); err == nil {
+			if d, err := p.demands.acquireTarget(key, countries, started, cfg, false, want); err == nil {
 				p.demands.served(d, started, len(found))
+				p.invalidateNeed()
 			}
 		}
 		return RequireResult{Proxies: found}, nil
 	}
 
-	d, err := p.demands.acquire(key, countries, started, cfg, true)
+	d, err := p.demands.acquireTarget(key, countries, started, cfg, true, want)
 	if err != nil {
 		return RequireResult{}, err
 	}
 	defer p.demands.release(d)
+	p.invalidateNeed()
+	p.signalWake()
 
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
@@ -179,8 +187,10 @@ type demand struct {
 	key             string
 	countries       []string
 	created         time.Time
-	expiresAt       time.Time
+	expiresAt       time.Time // end of the hunting window while nothing matches
+	replenishUntil  time.Time // end of target maintenance and of the registration
 	lastSatisfiedAt time.Time
+	target          int
 	waiters         int
 	served          int64
 }
@@ -215,6 +225,11 @@ func (r *demandRegistry) channel() <-chan struct{} {
 // acquire returns the demand for key, creating it when absent, and extends its
 // TTL. With waiter set, the caller is counted until release.
 func (r *demandRegistry) acquire(key string, countries []string, now time.Time, cfg Config, waiter bool) (*demand, error) {
+	return r.acquireTarget(key, countries, now, cfg, waiter, 0)
+}
+
+// acquireTarget is acquire with an explicit target; zero uses cfg.CountryTarget.
+func (r *demandRegistry) acquireTarget(key string, countries []string, now time.Time, cfg Config, waiter bool, want int) (*demand, error) {
 	var events []PoolEvent
 	r.mu.Lock()
 	events = append(events, r.purgeLocked(now)...)
@@ -234,7 +249,12 @@ func (r *demandRegistry) acquire(key string, countries []string, now time.Time, 
 		r.items[key] = d
 		events = append(events, PoolEvent{Time: now, Kind: "demand_created", Fields: demandFields(countries, nil)})
 	}
+	if want <= 0 {
+		want = cfg.CountryTarget
+	}
+	d.target = max(d.target, want)
 	d.expiresAt = now.Add(cfg.DemandTTL)
+	d.replenishUntil = now.Add(cfg.ReplenishTTL)
 	if waiter {
 		d.waiters++
 	}
@@ -258,20 +278,43 @@ func (r *demandRegistry) served(d *demand, now time.Time, n int) {
 	r.mu.Unlock()
 }
 
-// snapshot returns the registered demands sorted by key after dropping expired ones.
+// snapshot returns the registered demands sorted by key after dropping expired
+// ones. Alive and State are left unset; use snapshotWithCounts for them.
 func (r *demandRegistry) snapshot(now time.Time) []DemandStat {
+	return r.snapshotWithCounts(now, nil, 0)
+}
+
+// snapshotWithCounts also fills Alive and State from per-location alive counts.
+func (r *demandRegistry) snapshotWithCounts(now time.Time, counts map[string]int, total int) []DemandStat {
 	r.mu.Lock()
 	events := r.purgeLocked(now)
 	out := make([]DemandStat, 0, len(r.items))
 	for _, d := range r.items {
-		out = append(out, DemandStat{
+		stat := DemandStat{
 			Countries:       append([]string(nil), d.countries...),
 			Waiters:         d.waiters,
 			Served:          d.served,
+			Target:          d.target,
 			CreatedAt:       d.created,
 			ExpiresAt:       d.expiresAt,
+			ReplenishUntil:  d.replenishUntil,
 			LastSatisfiedAt: d.lastSatisfiedAt,
-		})
+		}
+		if counts != nil {
+			matching, hot, replenish := d.pressure(now, counts, total)
+			stat.Alive = matching
+			switch {
+			case d.waiters > 0:
+				stat.State = "waiting"
+			case hot:
+				stat.State = "hunting"
+			case replenish:
+				stat.State = "replenishing"
+			default:
+				stat.State = "satisfied"
+			}
+		}
+		out = append(out, stat)
 	}
 	r.mu.Unlock()
 	r.emitAll(events)
@@ -281,11 +324,46 @@ func (r *demandRegistry) snapshot(now time.Time) []DemandStat {
 	return out
 }
 
-// purgeLocked removes expired demands that have no waiters.
+// pressure reports how many alive proxies match the demand and whether it needs
+// priority work (hot) or target refilling (replenish).
+func (d *demand) pressure(now time.Time, counts map[string]int, total int) (matching int, hot, replenish bool) {
+	if len(d.countries) == 0 {
+		matching = total
+	} else {
+		for _, country := range d.countries {
+			matching += counts[country]
+		}
+	}
+	hot = d.waiters > 0 || (now.Before(d.expiresAt) && matching == 0)
+	replenish = len(d.countries) > 0 && now.Before(d.replenishUntil) && matching < d.target
+	return matching, hot, replenish
+}
+
+// evaluate derives scheduling pressure from all registered demands.
+func (r *demandRegistry) evaluate(now time.Time, counts map[string]int, total int) demandNeed {
+	need := demandNeed{Countries: make(map[string]struct{})}
+	r.mu.Lock()
+	events := r.purgeLocked(now)
+	for _, d := range r.items {
+		_, hot, replenish := d.pressure(now, counts, total)
+		need.Hot = need.Hot || hot
+		need.Replenish = need.Replenish || replenish
+		if hot || replenish {
+			for _, country := range d.countries {
+				need.Countries[country] = struct{}{}
+			}
+		}
+	}
+	r.mu.Unlock()
+	r.emitAll(events)
+	return need
+}
+
+// purgeLocked removes demands without waiters whose replenishment window ended.
 func (r *demandRegistry) purgeLocked(now time.Time) []PoolEvent {
 	var events []PoolEvent
 	for key, d := range r.items {
-		if d.waiters == 0 && !d.expiresAt.After(now) {
+		if d.waiters == 0 && !d.replenishUntil.After(now) {
 			delete(r.items, key)
 			events = append(events, r.expiredEvent(d, now, "ttl"))
 		}
@@ -293,14 +371,14 @@ func (r *demandRegistry) purgeLocked(now time.Time) []PoolEvent {
 	return events
 }
 
-// evictableLocked returns the waiter-free demand that expires first, or nil.
+// evictableLocked returns the waiter-free demand whose registration ends first, or nil.
 func (r *demandRegistry) evictableLocked() *demand {
 	var victim *demand
 	for _, d := range r.items {
 		if d.waiters > 0 {
 			continue
 		}
-		if victim == nil || d.expiresAt.Before(victim.expiresAt) {
+		if victim == nil || d.replenishUntil.Before(victim.replenishUntil) {
 			victim = d
 		}
 	}

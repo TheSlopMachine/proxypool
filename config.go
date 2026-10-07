@@ -23,6 +23,10 @@ type Config struct {
 	DemandTTL time.Duration
 	// MaxDemands caps the number of distinct registered demands.
 	MaxDemands int
+	// CountryTarget is the default number of alive proxies the pool keeps for a demanded country set.
+	CountryTarget int
+	// ReplenishTTL is how long a country target is maintained after the last Require call for it.
+	ReplenishTTL time.Duration
 }
 
 // DefaultConfig returns the scheduler defaults defined by the rollout plan.
@@ -44,6 +48,8 @@ func DefaultConfig() Config {
 		RequireTimeout:   60 * time.Second,
 		DemandTTL:        5 * time.Minute,
 		MaxDemands:       32,
+		CountryTarget:    10,
+		ReplenishTTL:     30 * time.Minute,
 	}
 }
 
@@ -97,6 +103,15 @@ func (c Config) Resolve() Config {
 	}
 	if c.MaxDemands <= 0 {
 		c.MaxDemands = def.MaxDemands
+	}
+	if c.CountryTarget <= 0 {
+		c.CountryTarget = def.CountryTarget
+	}
+	if c.ReplenishTTL <= 0 {
+		c.ReplenishTTL = def.ReplenishTTL
+	}
+	if c.ReplenishTTL < c.DemandTTL {
+		c.ReplenishTTL = c.DemandTTL
 	}
 	if c.MinLimit > c.InitialLimit {
 		c.InitialLimit = c.MinLimit

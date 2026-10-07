@@ -40,13 +40,13 @@ func (p *ProxyPool) Snapshot() PoolStats {
 	}
 
 	p.sched.mu.Lock()
-	stats.Queued = len(p.sched.candQ) - p.sched.candHead
-	if stats.Queued < 0 {
-		stats.Queued = 0
-	}
+	stats.Queued = len(p.sched.queued)
 	queuedBySource := make(map[string]int)
 	for n := p.sched.candHead; n < len(p.sched.candQ); n++ {
-		queuedBySource[p.sched.candQ[n].Source]++
+		// Entries consumed through a hint queue stay in candQ until the head passes them.
+		if _, ok := p.sched.queued[p.sched.candQ[n].URL]; ok {
+			queuedBySource[p.sched.candQ[n].Source]++
+		}
 	}
 	for source, count := range queuedBySource {
 		sourceStat(bySource, source).Queued = count
@@ -67,7 +67,8 @@ func (p *ProxyPool) Snapshot() PoolStats {
 	}
 	stats.LastIngestAt = p.sched.lastIngestAt
 	p.sched.mu.Unlock()
-	stats.Demands = p.demands.snapshot(now)
+	counts, total := p.index.countByLocation()
+	stats.Demands = p.demands.snapshotWithCounts(now, counts, total)
 
 	for _, ss := range bySource {
 		ss.BanReasons = copyReasonMap(ss.BanReasons)
