@@ -408,14 +408,6 @@ func (p *ProxyPool) cacheSnapshot() CacheSource {
 	return p.cache
 }
 
-func (p *ProxyPool) cacheGet(url string) (ProxyState, bool) {
-	cache := p.cacheSnapshot()
-	if cache == nil {
-		return ProxyState{}, false
-	}
-	return cache.Get(url)
-}
-
 func (p *ProxyPool) cacheAll() []ProxyState {
 	p.mu.RLock()
 	cache := p.cache

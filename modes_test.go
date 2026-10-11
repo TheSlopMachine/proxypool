@@ -22,7 +22,7 @@ func TestNextModeHysteresis(t *testing.T) {
 }
 
 func TestStarvedRevivalPrefersSoftFailure(t *testing.T) {
-	p := NewPool()
+	p, _ := NewPool(NewMemoryCache())
 	p.sched.mu.Lock()
 	p.sched.candQ = nil
 	p.sched.candHead = 0

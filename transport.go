@@ -72,7 +72,7 @@ func TransportFor(proxyURL string, timeout time.Duration) (*http.Transport, erro
 		}).DialContext,
 	}
 	switch p.scheme {
-	// Exhaustive over SupportedSchemes (parseProxyURL rejects the rest,
+	// Exhaustive over the supported schemes (parseProxyURL rejects the rest,
 	// so default is unreachable defense).
 	case "http", "https":
 		parsed, err := url.Parse(proxyURL)

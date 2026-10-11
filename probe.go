@@ -32,7 +32,7 @@ func verifyHandshake(ctx context.Context, proxyURL string, timeout time.Duration
 		return err
 	}
 	switch p.scheme {
-	// Exhaustive over SupportedSchemes (parseProxyURL rejects the rest,
+	// Exhaustive over the supported schemes (parseProxyURL rejects the rest,
 	// so default is unreachable defense).
 	case "http", "https":
 		return verifyHTTPHandshake(ctx, p.address(), timeout)
@@ -190,14 +190,6 @@ func deltaFor(lastCheckedAt, now time.Time) float64 {
 		delta = math.Min(1.0, math.Max(0.01, now.Sub(lastCheckedAt).Minutes()))
 	}
 	return delta
-}
-
-// classifyRevival snapshots a candidate's pre-probe lifecycle position for
-// post-probe Died/Revived edge detection.
-func classifyRevival(item ProxyState, now time.Time) (wasDead, wasRevived bool) {
-	wasDead = item.IsDead
-	wasRevived = item.IsDead && !item.ReviveAt.IsZero() && !now.Before(item.ReviveAt)
-	return wasDead, wasRevived
 }
 
 // applySuccess updates state after passing handshake + latency check.

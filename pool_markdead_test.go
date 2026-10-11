@@ -6,7 +6,7 @@ import (
 )
 
 func TestMarkDeadUnknown(t *testing.T) {
-	p := NewPool()
+	p, _ := NewPool(NewMemoryCache())
 	if p.MarkDead("", "dns_resolution") {
 		t.Fatal("empty URL must return false")
 	}
@@ -16,7 +16,7 @@ func TestMarkDeadUnknown(t *testing.T) {
 }
 
 func TestMarkDeadLeavesScoringUntouched(t *testing.T) {
-	p := NewPool()
+	p, _ := NewPool(NewMemoryCache())
 	url := "http://192.0.2.1:8080"
 	p.cache.Set(ProxyState{URL: url, IP: "192.0.2.1", Port: 8080, Score: 9.5, Penalty: 0.25})
 	if !p.MarkDead(url, "tls_certificate_verification") {
@@ -41,7 +41,7 @@ func TestMarkDeadLeavesScoringUntouched(t *testing.T) {
 }
 
 func TestMarkDeadEscalatesAndCaps(t *testing.T) {
-	p := NewPool()
+	p, _ := NewPool(NewMemoryCache())
 	url := "http://192.0.2.2:8080"
 	p.cache.Set(ProxyState{URL: url, IP: "192.0.2.2", Port: 8080})
 	var prev time.Time
@@ -68,7 +68,7 @@ func TestMarkDeadEscalatesAndCaps(t *testing.T) {
 }
 
 func TestMarkDeadFlapNeverForgivenIdleForgiven(t *testing.T) {
-	p := NewPool()
+	p, _ := NewPool(NewMemoryCache())
 	url := "http://192.0.2.3:8080"
 	p.cache.Set(ProxyState{URL: url, IP: "192.0.2.3", Port: 8080})
 	p.MarkDead(url, "dns_resolution")
@@ -88,7 +88,7 @@ func TestMarkDeadFlapNeverForgivenIdleForgiven(t *testing.T) {
 }
 
 func TestMergeManualMarkPreservesNewerMark(t *testing.T) {
-	p := NewPool()
+	p, _ := NewPool(NewMemoryCache())
 	url := "http://192.0.2.4:8080"
 	p.cache.Set(ProxyState{URL: url, IP: "192.0.2.4", Port: 8080})
 	snapshot, _ := p.cache.Get(url)
@@ -116,7 +116,7 @@ func TestMergeManualMarkKeepsPipelineVerdict(t *testing.T) {
 }
 
 func TestMarkDeadHidesFromList(t *testing.T) {
-	p := NewPool()
+	p, _ := NewPool(NewMemoryCache())
 	url := "http://192.0.2.6:8080"
 	p.cache.Set(ProxyState{URL: url, IP: "192.0.2.6", Port: 8080})
 	if len(p.ListProxies(ProxyFilter{})) != 1 {

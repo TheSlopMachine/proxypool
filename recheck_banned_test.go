@@ -6,7 +6,7 @@ import (
 )
 
 func TestRecheckBannedFiltersAndKeepsReviveAt(t *testing.T) {
-	p := NewPool()
+	p, _ := NewPool(NewMemoryCache())
 	now := time.Now().UTC()
 	keepRevive := now.Add(2 * time.Hour)
 	p.cache.Set(ProxyState{URL: "http://a:8080", IsDead: true, Source: "one", FailReason: FailRefused, ReviveAt: keepRevive, LastCheckedAt: now})

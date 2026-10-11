@@ -5,10 +5,8 @@ import (
 	"fmt"
 	"net"
 	"net/url"
-	"sort"
 	"strconv"
 	"strings"
-	"time"
 )
 
 // defaultPortByScheme supplies the implicit port when a proxy URL omits one.
@@ -17,14 +15,6 @@ var defaultPortByScheme = map[string]int{
 	"https":  443,
 	"socks4": 1080,
 	"socks5": 1080,
-}
-
-// SupportedSchemes lists the proxy schemes the prober can handle, in
-// canonical form. "socks4a" is accepted as an alias and canonicalizes to
-// "socks4". Feeds filter against IsSupportedScheme; transports switch on
-// the canonical scheme.
-func SupportedSchemes() []string {
-	return []string{"http", "https", "socks4", "socks5"}
 }
 
 // IsSupportedScheme reports whether scheme names a probed protocol,
@@ -94,19 +84,4 @@ func normalizeProxyURL(raw string) (ParsedEndpoint, error) {
 		Host:      host,
 		Port:      port,
 	}, nil
-}
-
-// medianDuration returns the 50th percentile duration from a slice.
-func medianDuration(vals []time.Duration) time.Duration {
-	if len(vals) == 0 {
-		return 0
-	}
-	sorted := make([]time.Duration, len(vals))
-	copy(sorted, vals)
-	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
-	n := len(sorted)
-	if n%2 == 1 {
-		return sorted[n/2]
-	}
-	return (sorted[n/2-1] + sorted[n/2]) / 2
 }

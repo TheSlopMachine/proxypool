@@ -13,7 +13,7 @@ func setAlive(p *ProxyPool, url, location string) {
 }
 
 func TestRequireFastPathMatchesCountryAndExclude(t *testing.T) {
-	p := NewPool()
+	p, _ := NewPool(NewMemoryCache())
 	setAlive(p, "http://1.1.1.1:80", "US")
 	setAlive(p, "http://2.2.2.2:80", "CA")
 	setAlive(p, "http://3.3.3.3:80", "DE")
@@ -42,7 +42,7 @@ func TestRequireFastPathMatchesCountryAndExclude(t *testing.T) {
 }
 
 func TestRequireEmptyCountriesAcceptsAny(t *testing.T) {
-	p := NewPool()
+	p, _ := NewPool(NewMemoryCache())
 	setAlive(p, "http://1.1.1.1:80", "BR")
 	res, err := p.Require(context.Background(), RequireOptions{})
 	if err != nil || len(res.Proxies) != 1 {
@@ -51,7 +51,7 @@ func TestRequireEmptyCountriesAcceptsAny(t *testing.T) {
 }
 
 func TestRequireLimitCapsResult(t *testing.T) {
-	p := NewPool()
+	p, _ := NewPool(NewMemoryCache())
 	for _, u := range []string{"http://1.1.1.1:80", "http://2.2.2.2:80", "http://3.3.3.3:80"} {
 		setAlive(p, u, "US")
 	}
@@ -62,7 +62,7 @@ func TestRequireLimitCapsResult(t *testing.T) {
 }
 
 func TestRequireRejectsInvalidCountry(t *testing.T) {
-	p := NewPool()
+	p, _ := NewPool(NewMemoryCache())
 	for _, bad := range []string{"USA", "U", "1A", ""} {
 		_, err := p.Require(context.Background(), RequireOptions{Countries: []string{bad}})
 		if !errors.Is(err, ErrInvalidCountry) {
@@ -72,7 +72,7 @@ func TestRequireRejectsInvalidCountry(t *testing.T) {
 }
 
 func TestRequireWaitsUntilMatchingProxyIsAlive(t *testing.T) {
-	p := NewPool()
+	p, _ := NewPool(NewMemoryCache())
 	setAlive(p, "http://9.9.9.9:80", "DE")
 
 	done := make(chan RequireResult, 1)
@@ -95,7 +95,7 @@ func TestRequireWaitsUntilMatchingProxyIsAlive(t *testing.T) {
 }
 
 func TestRequireTimeoutReturnsTimedOutAndKeepsDemand(t *testing.T) {
-	p := NewPool()
+	p, _ := NewPool(NewMemoryCache())
 	res, err := p.Require(context.Background(), RequireOptions{Countries: []string{"US"}, Timeout: 50 * time.Millisecond})
 	if err != nil || !res.TimedOut || len(res.Proxies) != 0 {
 		t.Fatalf("Require = %+v, %v", res, err)
@@ -107,7 +107,7 @@ func TestRequireTimeoutReturnsTimedOutAndKeepsDemand(t *testing.T) {
 }
 
 func TestRequireCancellationKeepsDemand(t *testing.T) {
-	p := NewPool()
+	p, _ := NewPool(NewMemoryCache())
 	ctx, cancel := context.WithCancel(context.Background())
 	errc := make(chan error, 1)
 	go func() {
@@ -131,7 +131,7 @@ func TestRequireCancellationKeepsDemand(t *testing.T) {
 }
 
 func TestRequireMergesWaitersIntoOneDemand(t *testing.T) {
-	p := NewPool()
+	p, _ := NewPool(NewMemoryCache())
 	var wg sync.WaitGroup
 	for i := 0; i < 3; i++ {
 		wg.Add(1)
@@ -196,7 +196,7 @@ func TestDemandLimitEvictsIdleAndRejectsWhenAllWaited(t *testing.T) {
 }
 
 func TestRequireFastPathRegistersCountryDemand(t *testing.T) {
-	p := NewPool()
+	p, _ := NewPool(NewMemoryCache())
 	setAlive(p, "http://1.1.1.1:80", "US")
 	if _, err := p.Require(context.Background(), RequireOptions{Countries: []string{"US"}}); err != nil {
 		t.Fatal(err)

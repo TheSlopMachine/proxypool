@@ -36,8 +36,11 @@ import (
 )
 
 func main() {
-	// 1. Initialize pool (defaults to thread-safe in-memory cache)
-	pool := proxypool.NewPool()
+	// 1. Initialize pool with a storage backend (nil cache is an error)
+	pool, err := proxypool.NewPool(proxypool.NewMemoryCache())
+	if err != nil {
+		panic(err)
+	}
 
 	// 2. Register one or more proxy sources
 	pool.RegisterProxySource(NewMyProxySource())
@@ -128,8 +131,8 @@ type CacheSource interface {
 }
 ```
 
-* **Default:** `NewPool()` starts with an internal, concurrent-safe in-memory cache.
-* **Hot Migration:** Calling `pool.RegisterCacheSource(customCache)` automatically reads `All()` from the existing cache and migrates every entry into the new storage backend (e.g., Redis, SQLite, PostgreSQL) without dropping pool reputation states.
+* **Storage:** `NewPool(cache)` takes the storage backend as a constructor argument and returns an error on a nil cache. `NewMemoryCache()` supplies the default concurrent-safe in-memory backend.
+* **Custom backends:** Pass any `CacheSource` (e.g., Redis, SQLite, PostgreSQL) directly to `NewPool`; the pool wraps it without runtime migration between backends.
 
 ---
 
@@ -164,7 +167,7 @@ pool.SetTimeout(proxypool.TimeoutConfig{Handshake: 3 * time.Second, Probe: 5 * t
 pool.SetLimits(10, 50, 500)
 ```
 
-Supported schemes are centralized too: feeds filter with `proxypool.IsSupportedScheme` (`SupportedSchemes()` lists the canonical set; `socks4a` canonicalizes to `socks4`).
+Supported schemes are centralized too: feeds filter with `proxypool.IsSupportedScheme` (`socks4a` canonicalizes to `socks4`).
 
 ---
 

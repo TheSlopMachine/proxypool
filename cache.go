@@ -17,6 +17,12 @@ func newMemoryCache() *memoryCache {
 	}
 }
 
+// NewMemoryCache returns the default thread-safe in-memory CacheSource.
+// Pass it to NewPool when no custom storage backend is needed.
+func NewMemoryCache() CacheSource {
+	return newMemoryCache()
+}
+
 func (m *memoryCache) Get(url string) (ProxyState, bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()

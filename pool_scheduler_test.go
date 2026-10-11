@@ -62,7 +62,7 @@ func startFakeHTTPProxy(t *testing.T) (string, func()) {
 func TestRefreshChecksCandidateAndPersistsResult(t *testing.T) {
 	proxyURL, cleanup := startFakeHTTPProxy(t)
 	defer cleanup()
-	p := NewPool()
+	p, _ := NewPool(NewMemoryCache())
 	p.SetTimeout(TimeoutConfig{Handshake: 100 * time.Millisecond, Probe: 100 * time.Millisecond})
 	p.SetLimits(1, 1, 1)
 	p.RegisterProxySource(tcpProxySource{url: proxyURL})

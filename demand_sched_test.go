@@ -6,7 +6,7 @@ import (
 )
 
 func TestPopCandidatePrefersHintedCountryAndSkipsConsumed(t *testing.T) {
-	p := NewPool()
+	p, _ := NewPool(NewMemoryCache())
 	add := func(url, country string) {
 		item := queuedCandidate{URL: url, Source: "feed", Country: country}
 		p.sched.candQ = append(p.sched.candQ, item)

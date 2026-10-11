@@ -22,7 +22,7 @@ func TestScheduleHeapOrdersByDueAt(t *testing.T) {
 }
 
 func TestSchedulerDeduplicatesQueuedAndInflight(t *testing.T) {
-	p := NewPool()
+	p, _ := NewPool(NewMemoryCache())
 	p.sched.mu.Lock()
 	p.sched.candQ = append(p.sched.candQ, queuedCandidate{URL: "http://1.2.3.4:8080", Source: "one"})
 	p.sched.queued["http://1.2.3.4:8080"] = struct{}{}

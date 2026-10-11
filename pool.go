@@ -56,9 +56,12 @@ type scheduler struct {
 	start  bool
 }
 
-// NewPool initializes a pool with the configured scheduler defaults and
-// default in-memory storage with no-op reporting.
-func NewPool() *ProxyPool {
+// NewPool initializes a pool with the given storage backend and no-op
+// reporting. The cache argument is required; a nil cache returns an error.
+func NewPool(cache CacheSource) (*ProxyPool, error) {
+	if cache == nil {
+		return nil, errors.New("proxypool: nil CacheSource")
+	}
 	cfg := DefaultConfig()
 	pool := &ProxyPool{
 		sources:   make([]ProxySource, 0),
@@ -79,8 +82,11 @@ func NewPool() *ProxyPool {
 	pool.demands = newDemandRegistry()
 	pool.demands.onEvent = pool.reportEvent
 	pool.index.onAlive = pool.demands.notify
-	pool.RegisterCacheSource(newMemoryCache())
-	return pool
+	pool.cache = &indexedCacheSource{inner: cache, index: pool.index}
+	states := cache.All()
+	pool.index.replace(states)
+	pool.sched.rebuildHeaps(states, cfg, time.Now().UTC())
+	return pool, nil
 }
 
 // reportEvent forwards one event to the currently registered reporter.
@@ -89,28 +95,6 @@ func (p *ProxyPool) reportEvent(event PoolEvent) {
 	reporter := p.reporter
 	p.mu.RUnlock()
 	reporter.ReportEvent(event)
-}
-
-// RegisterCacheSource switches the storage backend and automatically migrates
-// all existing proxy states from the old cache to the new one.
-func (p *ProxyPool) RegisterCacheSource(newCache CacheSource) {
-	if newCache == nil {
-		return
-	}
-
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	if p.cache != nil {
-		for _, state := range p.cache.All() {
-			newCache.Set(state)
-		}
-	}
-	p.index.replace(newCache.All())
-	p.cache = &indexedCacheSource{inner: newCache, index: p.index}
-	if p.sched != nil {
-		p.sched.rebuildHeaps(newCache.All(), p.config.Resolve(), time.Now().UTC())
-	}
 }
 
 // RegisterProxySource adds an upstream proxy feed provider.
@@ -132,20 +116,6 @@ func (p *ProxyPool) RegisterReporter(reporter Reporter) {
 		return
 	}
 	p.reporter = reporter
-}
-
-// SetConfig updates scheduler configuration. Zero values resolve to defaults.
-func (p *ProxyPool) SetConfig(c Config) {
-	c = c.Resolve()
-	p.mu.Lock()
-	p.config = c
-	if p.limiter == nil {
-		p.limiter = newLimiter(c.InitialLimit)
-	} else {
-		p.limiter.SetLimit(clampInt(p.limiter.Limit(), c.MinLimit, c.MaxLimit))
-	}
-	p.mu.Unlock()
-	p.signalWake()
 }
 
 // SetLimits sets the dynamic concurrency range and current initial limit.
@@ -266,11 +236,11 @@ func (p *ProxyPool) Stop() {
 
 // Refresh performs one blocking scheduler drain without starting background goroutines.
 // It ingests all sources, then checks candidates and due cached proxies using the same
-// queues, limiter, and checkOne implementation used by Start. It returns when candQ is
+// queues, limiter, and checkOneForced implementation used by Start. It returns when candQ is
 // empty and no live or banned items are due at the current time.
 func (p *ProxyPool) Refresh() {
 	// Refresh is a blocking one-shot drain for CLI and tests. It uses the same
-	// queues and checkOne implementation as Start without starting background lanes.
+	// queues and checkOneForced implementation as Start without starting background lanes.
 	now := time.Now().UTC()
 	p.ingestOnce(now)
 	p.seedDueStates(now)
@@ -471,10 +441,6 @@ func (p *ProxyPool) runCheckHeld(ctx context.Context, task scheduledTask) {
 	cache.Set(updated)
 	p.finishState(updated, cfg, task.lane)
 	reporter.ReportProxy(reportForState(report, updated))
-}
-
-func (p *ProxyPool) checkOne(ctx context.Context, state ProxyState, lane string) (ProxyState, ProxyReport, error) {
-	return p.checkOneForced(ctx, state, lane, false)
 }
 
 func (p *ProxyPool) checkOneForced(ctx context.Context, state ProxyState, lane string, forced bool) (ProxyState, ProxyReport, error) {

@@ -80,7 +80,7 @@ func TestApplyFailureV2(t *testing.T) {
 }
 
 func TestLivenessFailurePromotesToSuspect(t *testing.T) {
-	p := NewPool()
+	p, _ := NewPool(NewMemoryCache())
 	now := time.Now().UTC()
 	state := ProxyState{
 		URL:           "http://127.0.0.1:8080",
@@ -105,7 +105,7 @@ func TestLivenessFailurePromotesToSuspect(t *testing.T) {
 }
 
 func TestSuspect(t *testing.T) {
-	p := NewPool()
+	p, _ := NewPool(NewMemoryCache())
 	url := "http://192.0.2.10:8080"
 	p.cache.Set(ProxyState{URL: url, IP: "192.0.2.10", Port: 8080, Score: 9, Penalty: 0.5})
 	if !p.Suspect(url, FailEOF) {

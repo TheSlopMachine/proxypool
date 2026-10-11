@@ -20,8 +20,14 @@ func TestMemoryCacheClear(t *testing.T) {
 	}
 }
 
+func TestNewPoolNilCacheErrors(t *testing.T) {
+	if _, err := NewPool(nil); err == nil {
+		t.Fatal("NewPool(nil) must return an error")
+	}
+}
+
 func TestUpdateMetadataNoops(t *testing.T) {
-	p := NewPool()
+	p, _ := NewPool(NewMemoryCache())
 	// Must not panic on unknown URLs or nil updates.
 	p.UpdateMetadata("http://127.0.0.1:9", func(m map[string]string) { m["k"] = "v" })
 	p.UpdateMetadata("", nil)
@@ -33,7 +39,7 @@ func TestUpdateMetadataNoops(t *testing.T) {
 }
 
 func TestGetMetadataDetached(t *testing.T) {
-	p := NewPool()
+	p, _ := NewPool(NewMemoryCache())
 	p.cache.Set(ProxyState{URL: "http://127.0.0.1:9", Metadata: map[string]string{"k": "v"}})
 	got := p.GetMetadata("http://127.0.0.1:9")
 	got["k"] = "mutated"
@@ -58,7 +64,7 @@ func (c *countingCache) Set(state ProxyState) { c.sets++; c.memoryCache.Set(stat
 func (c *countingCache) Delete(url string)    { c.deletes++; c.memoryCache.Delete(url) }
 
 func TestIngestNewURLStaysOutOfCacheUntilCheck(t *testing.T) {
-	p := NewPool()
+	p, _ := NewPool(NewMemoryCache())
 	p.RegisterProxySource(stubPoolSource{urls: []string{"http://127.0.0.1:1"}, name: "feed"})
 	p.ingestOnce(time.Now().UTC())
 	if _, ok := p.cache.Get("http://127.0.0.1:1"); ok {
@@ -73,8 +79,10 @@ func TestIngestNewURLStaysOutOfCacheUntilCheck(t *testing.T) {
 
 func TestIngestKnownUpdatesSourceTimestampWithoutFrequentWrite(t *testing.T) {
 	cache := newCountingCache()
-	p := NewPool()
-	p.RegisterCacheSource(cache)
+	p, err := NewPool(cache)
+	if err != nil {
+		t.Fatalf("NewPool with custom cache: %v", err)
+	}
 	old := time.Now().UTC().Add(-10 * time.Minute)
 	cache.Set(ProxyState{URL: "http://127.0.0.1:2", Source: "feed", LastCheckedAt: old, LastSeenInSource: old})
 	baseline := cache.sets

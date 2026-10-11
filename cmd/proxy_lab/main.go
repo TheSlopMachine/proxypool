@@ -494,7 +494,11 @@ func main() {
 	}
 
 	// 3. Setup proxy pool, embedded upstream sources, and reporter
-	pool := proxypool.NewPool()
+	pool, err := proxypool.NewPool(proxypool.NewMemoryCache())
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Fatal: failed to initialize pool: %v\n", err)
+		os.Exit(1)
+	}
 	pool.SetLimits(*concurrencyFlag, *concurrencyFlag, *concurrencyFlag)
 	pool.SetTimeout(proxypool.TimeoutConfig{Handshake: *handshakeFlag, Probe: *timeoutFlag})
 	// Feed client: whole-request 30s cap plus 10s TLS/header caps so a
