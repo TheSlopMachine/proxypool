@@ -154,6 +154,10 @@ type PoolStats struct {
 	BanReasons   map[FailReason]int
 	LastIngestAt time.Time
 	Demands      []DemandStat // Registered country demands, sorted by key
+
+	// ForcedForeground reports that ForceForeground is active: the candidate
+	// queue is processed by the foreground lane regardless of Mode.
+	ForcedForeground bool
 }
 
 // ============================================================================

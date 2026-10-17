@@ -40,6 +40,11 @@ func (p *ProxyPool) Snapshot() PoolStats {
 	}
 
 	p.sched.mu.Lock()
+	stats.ForcedForeground = p.forcedForegroundLocked()
+	laneMode := stats.Mode
+	if stats.ForcedForeground {
+		laneMode = ModeForeground
+	}
 	stats.Queued = len(p.sched.queued)
 	queuedBySource := make(map[string]int)
 	for n := p.sched.candHead; n < len(p.sched.candQ); n++ {
@@ -53,10 +58,10 @@ func (p *ProxyPool) Snapshot() PoolStats {
 	}
 	for _, name := range []lane{laneForeground, laneBackground, laneLiveness, laneRevival} {
 		queued := p.laneQueuedLocked(name, now)
-		if name == laneForeground && stats.Mode == ModeBackground {
+		if name == laneForeground && laneMode == ModeBackground {
 			queued = 0
 		}
-		if name == laneBackground && stats.Mode == ModeForeground {
+		if name == laneBackground && laneMode == ModeForeground {
 			queued = 0
 		}
 		stats.Lanes = append(stats.Lanes, LaneStats{

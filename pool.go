@@ -47,6 +47,10 @@ type scheduler struct {
 	laneInflight map[string]int
 	lastIngestAt time.Time
 
+	// forceForeground makes the candidate lanes run in foreground mode until the
+	// candidate queue is drained. Guarded by mu.
+	forceForeground bool
+
 	wake      chan struct{}
 	ingestReq chan struct{}
 

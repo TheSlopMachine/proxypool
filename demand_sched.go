@@ -75,6 +75,9 @@ func (p *ProxyPool) laneMode(need demandNeed) Mode {
 	if need.Hot {
 		return ModeForeground
 	}
+	if p.forcedForeground() {
+		return ModeForeground
+	}
 	return p.Mode()
 }
 
